@@ -18,7 +18,131 @@ GGUF is a format based on the existing GGJT, but makes a few changes to the form
 
 The key difference between GGJT and GGUF is the use of a key-value structure for the hyperparameters (now referred to as metadata), rather than a list of untyped values. This allows for new metadata to be added without breaking compatibility with existing models, and to annotate the model with additional information that may be useful for inference or for identifying the model.
 
+### GGUF Naming Convention
+
+GGUF follow a naming convention of `[<Sidecar>]<BaseName><SizeLabel><FineTune><Version><Encoding><Type><Shard>.gguf` where each component is delimitated by a `-` if present. Ultimately this is intended to make it easier for humans to at a glance get the most important details of a model. It is not intended to be perfectly parsable in the field due to the diversity of existing gguf filenames.
+
+The components are:
+1. **Sidecar**: (Optional) Prefix marking the file as an auxiliary module loaded alongside a base model, rather than a standalone model. When present, sits at the very front of the filename followed by `-`. Lowercase by convention.
+    - `mmproj` : Multimodal projector (vision/audio encoder and projection layer for use with a base LLM)
+    - `mtp` : Multi-Token Prediction heads (speculative-decoding draft module, intended to be loaded alongside a base model of matching architecture and version). Note that oftentimes the MTP weights can be distributed inside the base model, in which case there is no separate `mtp-` sidecar file.
+1. **BaseName**: A descriptive name for the model base type or architecture.
+    - This can be derived from gguf metadata `general.basename` substituting spaces for dashes.
+1. **SizeLabel**: Parameter weight class (useful for leader boards) represented as `<expertCount>x<count><scale-prefix>`
+    - This can be derived from gguf metadata `general.size_label` if available or calculated if missing.
+    - Rounded decimal point is supported in count with a single letter scale prefix to assist in floating point exponent shown below
+      - `Q`: Quadrillion parameters.
+      - `T`: Trillion parameters.
+      - `B`: Billion parameters.
+      - `M`: Million parameters.
+      - `K`: Thousand parameters.
+    - Additional `-<attributes><count><scale-prefix>` can be appended as needed to indicate other attributes of interest
+1. **FineTune**: A descriptive name for the model fine tuning goal (e.g. Chat, Instruct, etc...)
+    - This can be derived from gguf metadata `general.finetune` substituting spaces for dashes.
+1. **Version**: (Optional) Denotes the model version number, formatted as `v<Major>.<Minor>`
+    - If model is missing a version number then assume `v1.0` (First Public Release)
+    - This can be derived from gguf metadata `general.version`
+1. **Encoding**: Indicates the weights encoding scheme that was applied to the model. Content, type mixture and arrangement however are determined by user code and can vary depending on project needs.
+1. **Type**: Indicates the kind of gguf file and the intended purpose for it
+    - If missing, then file is by default a typical gguf tensor model file
+    - `LoRA` : GGUF file is a LoRA adapter
+    - `vocab` : GGUF file with only vocab data and metadata
+1. **Shard**: (Optional) Indicates and denotes that the model has been split into multiple shards, formatted as `<ShardNum>-of-<ShardTotal>`.
+    - *ShardNum* : Shard position in this model. Must be 5 digits padded by zeros.
+      - Shard number always starts from `00001` onwards (e.g. First shard always starts at `00001-of-XXXXX` rather than `00000-of-XXXXX`).
+    - *ShardTotal* : Total number of shards in this model. Must be 5 digits padded by zeros.
+
+
+#### Validating Above Naming Convention
+
+At a minimum all model files should have at least BaseName, SizeLabel, Version, in order to be easily validated as a file that is keeping with the GGUF Naming Convention. An example of this issue is that it is easy for Encoding to be mistaken as a FineTune if Version is omitted.
+
+To validate you can use this regular expression `^(?:(?<Sidecar>mmproj|mtp)-)?(?<BaseName>[A-Za-z0-9\s]*(?:(?:-(?:(?:[A-Za-z\s][A-Za-z0-9\s]*)|(?:[0-9\s]*)))*))-(?:(?<SizeLabel>(?:\d+x)?(?:\d+\.)?\d+[A-Za-z](?:-[A-Za-z]+(\d+\.)?\d+[A-Za-z]+)?)(?:-(?<FineTune>[A-Za-z0-9\s-]+))?)?-(?:(?<Version>v\d+(?:\.\d+)*))(?:-(?<Encoding>(?!LoRA|vocab)[\w_]+))?(?:-(?<Type>LoRA|vocab))?(?:-(?<Shard>\d{5}-of-\d{5}))?\.gguf$` which will check that you got the minimum BaseName, SizeLabel and Version present in the correct order.
+
+For example:
+
+  * `Mixtral-8x7B-v0.1-KQ2.gguf`:
+    - Model Name: Mixtral
+    - Expert Count: 8
+    - Parameter Count: 7B
+    - Version Number: v0.1
+    - Weight Encoding Scheme: KQ2
+
+  * `Hermes-2-Pro-Llama-3-8B-F16.gguf`:
+    - Model Name: Hermes 2 Pro Llama 3
+    - Expert Count: 0
+    - Parameter Count: 8B
+    - Version Number: v1.0
+    - Weight Encoding Scheme: F16
+    - Shard: N/A
+
+  * `Grok-100B-v1.0-Q4_0-00003-of-00009.gguf`
+    - Model Name: Grok
+    - Expert Count: 0
+    - Parameter Count: 100B
+    - Version Number: v1.0
+    - Weight Encoding Scheme: Q4_0
+    - Shard: 3 out of 9 total shards
+
+  * `mtp-Qwen3-27B-v1.0-Q4_K_M.gguf`
+    - Sidecar: mtp (Multi-Token Prediction draft module)
+    - Model Name: Qwen3
+    - Expert Count: 0
+    - Parameter Count: 27B (of the main model — sidecar tensors are smaller)
+    - Version Number: v1.0
+    - Weight Encoding Scheme: Q4_K_M
+
+  * `mmproj-Qwen2-VL-7B-v1.0-F16.gguf`
+    - Sidecar: mmproj (multimodal projector)
+    - Model Name: Qwen2-VL
+    - Expert Count: 0
+    - Parameter Count: 7B (of the main model — sidecar tensors are smaller)
+    - Version Number: v1.0
+    - Weight Encoding Scheme: F16
+
+
+<details><summary>Example Node.js Regex Function</summary>
+
+```js
+#!/usr/bin/env node
+const ggufRegex = /^(?:(?<Sidecar>mmproj|mtp)-)?(?<BaseName>[A-Za-z0-9\s]*(?:(?:-(?:(?:[A-Za-z\s][A-Za-z0-9\s]*)|(?:[0-9\s]*)))*))-(?:(?<SizeLabel>(?:\d+x)?(?:\d+\.)?\d+[A-Za-z](?:-[A-Za-z]+(\d+\.)?\d+[A-Za-z]+)?)(?:-(?<FineTune>[A-Za-z0-9\s-]+))?)?-(?:(?<Version>v\d+(?:\.\d+)*))(?:-(?<Encoding>(?!LoRA|vocab)[\w_]+))?(?:-(?<Type>LoRA|vocab))?(?:-(?<Shard>\d{5}-of-\d{5}))?\.gguf$/;
+
+function parseGGUFFilename(filename) {
+  const match = ggufRegex.exec(filename);
+  if (!match)
+    return null;
+  const {Sidecar = null, BaseName = null, SizeLabel = null, FineTune = null, Version = "v1.0", Encoding = null, Type = null, Shard = null} = match.groups;
+  return {Sidecar: Sidecar, BaseName: BaseName, SizeLabel: SizeLabel, FineTune: FineTune, Version: Version, Encoding: Encoding, Type: Type, Shard: Shard};
+}
+
+const testCases = [
+  {filename: 'Mixtral-8x7B-v0.1-KQ2.gguf',                         expected: { Sidecar: null,   BaseName: 'Mixtral',              SizeLabel: '8x7B',     FineTune: null, Version: 'v0.1',   Encoding: 'KQ2',    Type: null, Shard: null}},
+  {filename: 'Grok-100B-v1.0-Q4_0-00003-of-00009.gguf',            expected: { Sidecar: null,   BaseName: 'Grok',                 SizeLabel: '100B',     FineTune: null, Version: 'v1.0',   Encoding: 'Q4_0',   Type: null, Shard: "00003-of-00009"}},
+  {filename: 'Hermes-2-Pro-Llama-3-8B-v1.0-F16.gguf',              expected: { Sidecar: null,   BaseName: 'Hermes-2-Pro-Llama-3', SizeLabel: '8B',       FineTune: null, Version: 'v1.0',   Encoding: 'F16',    Type: null, Shard: null}},
+  {filename: 'Phi-3-mini-3.8B-ContextLength4k-instruct-v1.0.gguf', expected: { Sidecar: null,   BaseName: 'Phi-3-mini',           SizeLabel: '3.8B-ContextLength4k', FineTune: 'instruct', Version: 'v1.0', Encoding: null,    Type: null, Shard: null}},
+  {filename: 'mtp-Qwen3-27B-v1.0-Q4_K_M.gguf',                     expected: { Sidecar: 'mtp',  BaseName: 'Qwen3',                SizeLabel: '27B',      FineTune: null, Version: 'v1.0',   Encoding: 'Q4_K_M', Type: null, Shard: null}},
+  {filename: 'mmproj-Qwen2-VL-7B-v1.0-F16.gguf',                   expected: { Sidecar: 'mmproj', BaseName: 'Qwen2-VL',           SizeLabel: '7B',       FineTune: null, Version: 'v1.0',   Encoding: 'F16',    Type: null, Shard: null}},
+  {filename: 'not-a-known-arrangement.gguf',                       expected: null},
+];
+
+testCases.forEach(({ filename, expected }) => {
+  const result = parseGGUFFilename(filename);
+  const passed = JSON.stringify(result) === JSON.stringify(expected);
+  console.log(`${filename}: ${passed ? "PASS" : "FAIL"}`);
+  if (!passed) {
+      console.log(result);
+      console.log(expected);
+  }
+});
+```
+
+</details>
+
+
 ### File Structure
+
+![image](https://github.com/ggerganov/ggml/assets/1991296/c3623641-3a1d-408e-bfaf-1b7c4e16aa63)
+*diagram by [@mishig25](https://github.com/mishig25) (GGUF v3)*
 
 GGUF files are structured as follows. They use a global alignment specified in the `general.alignment` metadata field, referred to as `ALIGNMENT` below. Where required, the file is padded with `0x00` bytes to the next multiple of `general.alignment`.
 
@@ -28,27 +152,47 @@ Models are little-endian by default. They can also come in big-endian for use wi
 
 ```c
 enum ggml_type: uint32_t {
-    GGML_TYPE_F32  = 0,
-    GGML_TYPE_F16  = 1,
-    GGML_TYPE_Q4_0 = 2,
-    GGML_TYPE_Q4_1 = 3,
+    GGML_TYPE_F32     = 0,
+    GGML_TYPE_F16     = 1,
+    GGML_TYPE_Q4_0    = 2,
+    GGML_TYPE_Q4_1    = 3,
     // GGML_TYPE_Q4_2 = 4, support has been removed
-    // GGML_TYPE_Q4_3 (5) support has been removed
-    GGML_TYPE_Q5_0 = 6,
-    GGML_TYPE_Q5_1 = 7,
-    GGML_TYPE_Q8_0 = 8,
-    GGML_TYPE_Q8_1 = 9,
-    // k-quantizations
-    GGML_TYPE_Q2_K = 10,
-    GGML_TYPE_Q3_K = 11,
-    GGML_TYPE_Q4_K = 12,
-    GGML_TYPE_Q5_K = 13,
-    GGML_TYPE_Q6_K = 14,
-    GGML_TYPE_Q8_K = 15,
-    GGML_TYPE_I8,
-    GGML_TYPE_I16,
-    GGML_TYPE_I32,
-    GGML_TYPE_COUNT,
+    // GGML_TYPE_Q4_3 = 5, support has been removed
+    GGML_TYPE_Q5_0    = 6,
+    GGML_TYPE_Q5_1    = 7,
+    GGML_TYPE_Q8_0    = 8,
+    GGML_TYPE_Q8_1    = 9,
+    GGML_TYPE_Q2_K    = 10,
+    GGML_TYPE_Q3_K    = 11,
+    GGML_TYPE_Q4_K    = 12,
+    GGML_TYPE_Q5_K    = 13,
+    GGML_TYPE_Q6_K    = 14,
+    GGML_TYPE_Q8_K    = 15,
+    GGML_TYPE_IQ2_XXS = 16,
+    GGML_TYPE_IQ2_XS  = 17,
+    GGML_TYPE_IQ3_XXS = 18,
+    GGML_TYPE_IQ1_S   = 19,
+    GGML_TYPE_IQ4_NL  = 20,
+    GGML_TYPE_IQ3_S   = 21,
+    GGML_TYPE_IQ2_S   = 22,
+    GGML_TYPE_IQ4_XS  = 23,
+    GGML_TYPE_I8      = 24,
+    GGML_TYPE_I16     = 25,
+    GGML_TYPE_I32     = 26,
+    GGML_TYPE_I64     = 27,
+    GGML_TYPE_F64     = 28,
+    GGML_TYPE_IQ1_M   = 29,
+    GGML_TYPE_BF16    = 30,
+    // GGML_TYPE_Q4_0_4_4 = 31, support has been removed from gguf files
+    // GGML_TYPE_Q4_0_4_8 = 32,
+    // GGML_TYPE_Q4_0_8_8 = 33,
+    GGML_TYPE_TQ1_0   = 34,
+    GGML_TYPE_TQ2_0   = 35,
+    // GGML_TYPE_IQ4_NL_4_4 = 36,
+    // GGML_TYPE_IQ4_NL_4_8 = 37,
+    // GGML_TYPE_IQ4_NL_8_8 = 38,
+    GGML_TYPE_MXFP4   = 39, // MXFP4 (1 block)
+    GGML_TYPE_COUNT   = 40,
 };
 
 enum gguf_metadata_value_type: uint32_t {
@@ -82,7 +226,7 @@ enum gguf_metadata_value_type: uint32_t {
     GGUF_METADATA_VALUE_TYPE_INT64 = 11,
     // The value is a 64-bit IEEE754 floating point number.
     GGUF_METADATA_VALUE_TYPE_FLOAT64 = 12,
-}
+};
 
 // A string in GGUF.
 struct gguf_string_t {
@@ -90,7 +234,7 @@ struct gguf_string_t {
     uint64_t len;
     // The string as a UTF-8 non-null-terminated string.
     char string[len];
-}
+};
 
 union gguf_metadata_value_t {
     uint8_t uint8;
@@ -234,17 +378,32 @@ By convention, most counts/lengths/etc are `uint64` unless otherwise specified. 
   - `gpt2`
   - `bloom`
   - `falcon`
+  - `mamba`
   - `rwkv`
 - **`general.quantization_version: uint32`**: The version of the quantization format. Not required if the model is not quantized (i.e. no tensors are quantized). If any tensors are quantized, this _must_ be present. This is separate to the quantization scheme of the tensors itself; the quantization version may change without changing the scheme's name (e.g. the quantization scheme is Q5_K, and the quantization version is 4).
 - **`general.alignment: uint32`**: the global alignment to use, as described above. This can vary to allow for different alignment schemes, but it must be a multiple of 8. Some writers may not write the alignment. If the alignment is **not** specified, assume it is `32`.
 
 #### General metadata
 
-- `general.name`: The name of the model. This should be a human-readable name that can be used to identify the model. It should be unique within the community that the model is defined in.
-- `general.author`: The author of the model.
-- `general.url`: URL to the model's homepage. This can be a GitHub repo, a paper, etc.
+- `general.name: string`: The name of the model. This should be a human-readable name that can be used to identify the model. It should be unique within the community that the model is defined in.
+- `general.author: string`: The author of the model.
+- `general.version: string`: The version of the model.
+- `general.organization: string`: The organization of the model.
+- `general.basename: string`: The base model name / architecture of the model
+- `general.finetune: string`: What has the base model been optimized toward.
 - `general.description: string`: free-form description of the model including anything that isn't covered by the other fields
+- `general.quantized_by: string`: The name of the individual who quantized the model
+- `general.size_label: string`: Size class of the model, such as number of weights and experts. (Useful for leader boards)
 - `general.license: string`: License of the model, expressed as a [SPDX license expression](https://spdx.github.io/spdx-spec/v2-draft/SPDX-license-expressions/) (e.g. `"MIT OR Apache-2.0`). Do not include any other information, such as the license text or the URL to the license.
+- `general.license.name: string`: Human friendly license name
+- `general.license.link: string`: URL to the license.
+- `general.url: string`: URL to the model's homepage. This can be a GitHub repo, a paper, etc.
+- `general.doi: string`: Digital Object Identifier (DOI) https://www.doi.org/
+- `general.uuid: string`: [Universally unique identifier](https://en.wikipedia.org/wiki/Universally_unique_identifier)
+- `general.repo_url: string`: URL to the model's repository such as a GitHub repo or HuggingFace repo
+- `general.tags: string[]`: List of tags that can be used as search terms for a search engine or social media
+- `general.languages: string[]`: What languages can the model speak. Encoded as [ISO 639](https://en.wikipedia.org/wiki/List_of_ISO_639_language_codes) two letter codes
+- `general.datasets: string[]`: Links or references to datasets that the model was trained upon
 - `general.file_type: uint32`: An enumerated value describing the type of the majority of the tensors in the file. Optional; can be inferred from the tensor types.
   - `ALL_F32 = 0`
   - `MOSTLY_F16 = 1`
@@ -270,8 +429,20 @@ By convention, most counts/lengths/etc are `uint64` unless otherwise specified. 
 
 Information about where this model came from. This is useful for tracking the provenance of the model, and for finding the original source if the model is modified. For a model that was converted from GGML, for example, these keys would point to the model that was converted from.
 
-- `general.source.url: string`: URL to the source of the model. Can be a GitHub repo, a paper, etc.
-- `general.source.huggingface.repository: string`: Hugging Face model repository that this model is either hosted on or based on
+- `general.source.url: string`: URL to the source of the model's homepage. This can be a GitHub repo, a paper, etc.
+- `general.source.doi: string`: Source Digital Object Identifier (DOI) https://www.doi.org/
+- `general.source.uuid: string`: Source [Universally unique identifier](https://en.wikipedia.org/wiki/Universally_unique_identifier)
+- `general.source.repo_url: string`: URL to the source of the model's repository such as a GitHub repo or HuggingFace repo
+
+- `general.base_model.count: uint32`: Number of parent models
+- `general.base_model.{id}.name: string`: The name of the parent model.
+- `general.base_model.{id}.author: string`: The author of the parent model.
+- `general.base_model.{id}.version: string`: The version of the parent model.
+- `general.base_model.{id}.organization: string`: The organization of the parent model.
+- `general.base_model.{id}.url: string`: URL to the source of the parent model's homepage. This can be a GitHub repo, a paper, etc.
+- `general.base_model.{id}.doi: string`: Parent Digital Object Identifier (DOI) https://www.doi.org/
+- `general.base_model.{id}.uuid: string`: Parent [Universally unique identifier](https://en.wikipedia.org/wiki/Universally_unique_identifier)
+- `general.base_model.{id}.repo_url: string`: URL to the source of the parent model's repository such as a GitHub repo or HuggingFace repo
 
 ### LLM
 
@@ -318,6 +489,13 @@ Note that older models may not have these keys, and may instead use the followin
 - `[llm].rope.scale_linear: float32`: A linear scale factor for RoPE to adjust the context length.
 
 It is recommended that models use the newer keys if possible, as they are more flexible and allow for more complex scaling schemes. Executors will need to support both indefinitely.
+
+#### SSM
+
+- `[llm].ssm.conv_kernel: uint32`: The size of the rolling/shift state.
+- `[llm].ssm.inner_size: uint32`: The embedding size of the states.
+- `[llm].ssm.state_size: uint32`: The size of the recurrent state.
+- `[llm].ssm.time_step_rank: uint32`: The rank of time steps.
 
 #### Models
 
@@ -437,6 +615,17 @@ The following sections describe the metadata for each model architecture. Each k
 
         model[src] = torch.cat((q,k,v)).reshape_as(model[src])
     ```
+
+##### Mamba
+
+- `mamba.context_length`
+- `mamba.embedding_length`
+- `mamba.block_count`
+- `mamba.ssm.conv_kernel`
+- `mamba.ssm.inner_size`
+- `mamba.ssm.state_size`
+- `mamba.ssm.time_step_rank`
+- `mamba.attention.layer_norm_rms_epsilon`
 
 ##### RWKV
 
@@ -559,10 +748,18 @@ where N signifies the block number a layer belongs to, and where `BB` could be:
 - `ffn_up`: Feed-forward network "up" layer
 - `ffn_gate`: Feed-forward network "gate" layer
 - `ffn_down`: Feed-forward network "down" layer
-- `ffn_gate_inp`: Expert-routing layer for the Fee-forward network in MoE models
+- `ffn_gate_inp`: Expert-routing layer for the Feed-forward network in MoE models
 - `ffn_gate_exp`: Feed-forward network "gate" layer per expert in MoE models
 - `ffn_down_exp`: Feed-forward network "down" layer per expert in MoE models
 - `ffn_up_exp`: Feed-forward network "up" layer per expert in MoE models
+
+- `ssm_in`: State space model input projections layer
+- `ssm_conv1d`: State space model rolling/shift layer
+- `ssm_x`: State space model selective parametrization layer
+- `ssm_a`: State space model state compression layer
+- `ssm_d`: State space model skip connection layer
+- `ssm_dt`: State space model time step layer
+- `ssm_out`: State space model output projection layer
 
 ## Version History
 

@@ -1,8 +1,9 @@
-#include "ggml/ggml.h"
-#include "ggml/ggml-alloc.h"
-#include "ggml/ggml-backend.h"
+#include "ggml.h"
+#include "ggml-cpu.h"
+#include "ggml-alloc.h"
+#include "ggml-backend.h"
 
-#ifdef GGML_USE_CUBLAS
+#ifdef GGML_USE_CUDA
 #include "ggml-cuda.h"
 #endif
 
@@ -76,8 +77,8 @@ struct gpt2_model {
     struct ggml_tensor * ln_f_g;
     struct ggml_tensor * ln_f_b;
 
-    struct ggml_tensor * wte;     // position embedding
-    struct ggml_tensor * wpe;     //    token embedding
+    struct ggml_tensor * wte;     //    token embedding
+    struct ggml_tensor * wpe;     // position embedding
     struct ggml_tensor * lm_head; // language model head
 
     std::vector<gpt2_layer> layers;
@@ -178,6 +179,8 @@ bool gpt2_model_load(const std::string & fname, gpt2_model & model, gpt_vocab & 
         return false;
     }
 
+    ggml_log_set(ggml_log_callback_default, nullptr);
+
     auto & ctx = model.ctx_w;
 
     // create the ggml context
@@ -197,7 +200,7 @@ bool gpt2_model_load(const std::string & fname, gpt2_model & model, gpt_vocab & 
     }
 
     // initialize the backend
-#ifdef GGML_USE_CUBLAS
+#ifdef GGML_USE_CUDA
     if (n_gpu_layers > 0) {
         fprintf(stderr, "%s: using CUDA backend\n", __func__);
         model.backend = ggml_backend_cuda_init(0);
@@ -210,7 +213,6 @@ bool gpt2_model_load(const std::string & fname, gpt2_model & model, gpt_vocab & 
 #ifdef GGML_USE_METAL
     if (n_gpu_layers > 0) {
         fprintf(stderr, "%s: using Metal backend\n", __func__);
-        ggml_backend_metal_log_set_callback(ggml_log_callback_default, nullptr);
         model.backend = ggml_backend_metal_init();
         if (!model.backend) {
             fprintf(stderr, "%s: ggml_backend_metal_init() failed\n", __func__);
@@ -335,6 +337,8 @@ bool gpt2_model_load(const std::string & fname, gpt2_model & model, gpt_vocab & 
         const int n_mem      = n_layer*n_ctx;
         const int n_elements = n_embd*n_mem;
 
+        // k and v here can also be GGML_TYPE_F16 to save memory and speed up the computation
+        // if backend supports it
         model.memory_k = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_elements);
         model.memory_v = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_elements);
 
@@ -538,9 +542,7 @@ struct ggml_cgraph * gpt2_graph(
             // [64, N, 12]
             struct ggml_tensor * Q =
                 ggml_permute(ctx,
-                        ggml_cpy(ctx,
-                            Qcur,
-                            ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd/n_head, n_head, N)),
+                        ggml_cont_3d(ctx, Qcur, n_embd/n_head, n_head, N),
                         0, 2, 1, 3);
 
             // K = Kmem.view(n_embd/n_head, n_head, n_past + N).permute(0, 2, 1, 3)
@@ -586,13 +588,13 @@ struct ggml_cgraph * gpt2_graph(
             // V_trans = Vmem.view(n_embd/n_head, n_head, n_past + N).permute(1, 2, 0, 3).contiguous()
             // [n_past + N, 64, 12]
             struct ggml_tensor * V_trans =
-                ggml_cpy(ctx,
+                ggml_cont_3d(ctx,
                         ggml_permute(ctx,
                             ggml_reshape_3d(ctx,
                                 ggml_view_1d(ctx, model.memory_v, (n_past + N)*n_embd, il*n_ctx*ggml_element_size(model.memory_v)*n_embd),
                                 n_embd/n_head, n_head, n_past + N),
                             1, 2, 0, 3),
-                        ggml_new_tensor_3d(ctx, model.memory_v->type, n_past + N, n_embd/n_head, n_head));
+                        n_past + N, n_embd/n_head, n_head);
 
             // KQV = transpose(V) * KQ_soft_max
             // [64, N, 12]
@@ -604,9 +606,7 @@ struct ggml_cgraph * gpt2_graph(
 
             // cur = KQV_merged.contiguous().view(n_embd, N)
             // [768, N]
-            cur = ggml_cpy(ctx,
-                    KQV_merged,
-                    ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, N));
+            cur = ggml_cont_2d(ctx, KQV_merged, n_embd, N);
         }
 
         // projection
@@ -761,12 +761,6 @@ bool gpt2_eval(
     if (ggml_backend_is_cpu(model.backend)) {
         ggml_backend_cpu_set_n_threads(model.backend, n_threads);
     }
-
-#ifdef GGML_USE_METAL
-    if (ggml_backend_is_metal(model.backend)) {
-        ggml_backend_metal_set_n_cb(model.backend, n_threads);
-    }
-#endif
 
     // run the computation
     ggml_backend_graph_compute(model.backend, gf);

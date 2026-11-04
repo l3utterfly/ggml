@@ -53,21 +53,18 @@ while read c; do
     fi
 
     git format-patch -k $c~1..$c --stdout -- \
-    ggml*.h \
-    ggml*.c \
-    ggml*.cpp \
-    ggml*.m \
-    ggml*.metal \
-    ggml*.cu \
-    whisper.h \
-    whisper.cpp \
-    examples/common.h \
-    examples/common.cpp \
-    examples/common-ggml.h \
-    examples/common-ggml.cpp \
-    examples/main/main.cpp \
-    examples/quantize/quantize.cpp \
-    >> $SRC_GGML/whisper-src.patch
+        ggml/CMakeLists.txt \
+        ggml/src/CMakeLists.txt \
+        ggml/cmake/FindSIMD.cmake \
+        ggml/src/ggml* \
+        ggml/src/gguf* \
+        ggml/include/ggml*.h \
+        ggml/include/gguf*.h \
+        examples/common-ggml.h \
+        examples/common-ggml.cpp \
+        LICENSE \
+        scripts/gen-authors.sh \
+        >> $SRC_GGML/whisper-src.patch
 done < $SRC_GGML/whisper-commits
 
 rm -v $SRC_GGML/whisper-commits
@@ -92,74 +89,38 @@ if [ -f $SRC_GGML/whisper-src.patch ]; then
 
     # replace filenames:
     #
-    # ggml.c              -> src/ggml.c
-    # ggml-alloc.c        -> src/ggml-alloc.c
-    # ggml-backend-impl.h -> src/ggml-backend-impl.h
-    # ggml-backend.c      -> src/ggml-backend.c
-    # ggml-cuda.cu        -> src/ggml-cuda.cu
-    # ggml-cuda.h         -> src/ggml-cuda.h
-    # ggml-impl.h         -> src/ggml-impl.h
-    # ggml-kompute.cpp    -> src/ggml-kompute.cpp
-    # ggml-kompute.h      -> src/ggml-kompute.h
-    # ggml-metal.h        -> src/ggml-metal.h
-    # ggml-metal.m        -> src/ggml-metal.m
-    # ggml-mpi.h          -> src/ggml-mpi.h
-    # ggml-mpi.c          -> src/ggml-mpi.c
-    # ggml-opencl.cpp     -> src/ggml-opencl.cpp
-    # ggml-opencl.h       -> src/ggml-opencl.h
-    # ggml-quants.c       -> src/ggml-quants.c
-    # ggml-quants.h       -> src/ggml-quants.h
-    # ggml-sycl.cpp       -> src/ggml-sycl.cpp
-    # ggml-sycl.h         -> src/ggml-sycl.h
-    # ggml-vulkan.cpp    -> src/ggml-vulkan.cpp
-    # ggml-vulkan.h      -> src/ggml-vulkan.h
-    # ggml.h              -> include/ggml/ggml.h
-    # ggml-alloc.h        -> include/ggml/ggml-alloc.h
-    # ggml-backend.h      -> include/ggml/ggml-backend.h
+    # ggml/CMakelists.txt       -> CMakeLists.txt
+    # ggml/src/CMakelists.txt   -> src/CMakeLists.txt
+    # ggml/cmake/FindSIMD.cmake -> cmake/FindSIMD.cmake
     #
-    # whisper.h           -> examples/whisper/whisper.h
-    # whisper.cpp         -> examples/whisper/whisper.cpp
+    # ggml/src/ggml* -> src/ggml*
+    # ggml/src/gguf* -> src/gguf*
     #
-    # examples/common.h              -> examples/common.h
-    # examples/common.cpp            -> examples/common.cpp
-    # examples/common-ggml.h         -> examples/common-ggml.h
-    # examples/common-ggml.cpp       -> examples/common-ggml.cpp
-    # examples/main/main.cpp         -> examples/whisper/main.cpp
-    # examples/quantize/quantize.cpp -> examples/whisper/quantize.cpp
+    # ggml/include/ggml*.h -> include/ggml*.h
+    # ggml/include/gguf*.h -> include/gguf*.h
+    #
+    # examples/common.h        -> examples/common.h
+    # examples/common.cpp      -> examples/common.cpp
+    # examples/common-ggml.h   -> examples/common-ggml.h
+    # examples/common-ggml.cpp -> examples/common-ggml.cpp
+    #
+    # LICENSE                -> LICENSE
+    # scripts/gen-authors.sh -> scripts/gen-authors.sh
 
-    cat whisper-src.patch | sed \
-        -e 's/\/ggml\.c/\/src\/ggml.c/g' \
-        -e 's/\/ggml-alloc\.c/\/src\/ggml-alloc.c/g' \
-        -e 's/\/ggml-backend-impl\.h/\/src\/ggml-backend-impl.h/g' \
-        -e 's/\/ggml-backend\.c/\/src\/ggml-backend.c/g' \
-        -e 's/\/ggml-cuda\.cu/\/src\/ggml-cuda.cu/g' \
-        -e 's/\/ggml-cuda\.h/\/src\/ggml-cuda.h/g' \
-        -e 's/\/ggml-impl\.h/\/src\/ggml-impl.h/g' \
-        -e 's/\/ggml-kompute\.cpp/\/src\/ggml-kompute.cpp/g' \
-        -e 's/\/ggml-kompute\.h/\/src\/ggml-kompute.h/g' \
-        -e 's/\/ggml-metal\.h/\/src\/ggml-metal.h/g' \
-        -e 's/\/ggml-metal\.m/\/src\/ggml-metal.m/g' \
-        -e 's/\/ggml-mpi\.h/\/src\/ggml-mpi.h/g' \
-        -e 's/\/ggml-mpi\.c/\/src\/ggml-mpi.c/g' \
-        -e 's/\/ggml-opencl\.cpp/\/src\/ggml-opencl.cpp/g' \
-        -e 's/\/ggml-opencl\.h/\/src\/ggml-opencl.h/g' \
-        -e 's/\/ggml-quants\.c/\/src\/ggml-quants.c/g' \
-        -e 's/\/ggml-quants\.h/\/src\/ggml-quants.h/g' \
-        -e 's/\/ggml-sycl\.cpp/\/src\/ggml-sycl.cpp/g' \
-        -e 's/\/ggml-sycl\.h/\/src\/ggml-sycl.h/g' \
-        -e 's/\/ggml-vulkan\.cpp/\/src\/ggml-vulkan.cpp/g' \
-        -e 's/\/ggml-vulkan\.h/\/src\/ggml-vulkan.h/g' \
-        -e 's/\/ggml\.h/\/include\/ggml\/ggml.h/g' \
-        -e 's/\/ggml-alloc\.h/\/include\/ggml\/ggml-alloc.h/g' \
-        -e 's/\/ggml-backend\.h/\/include\/ggml\/ggml-backend.h/g' \
-        -e 's/\/whisper\.h/\/examples\/whisper\/whisper.h/g' \
-        -e 's/\/whisper\.cpp/\/examples\/whisper\/whisper.cpp/g' \
+    cat whisper-src.patch | sed -E \
+        -e 's/\/ggml\/CMakeLists\.txt/\/CMakeLists.txt/g' \
+        -e 's/\/ggml\/src\/CMakeLists\.txt/\/src\/CMakeLists.txt/g' \
+        -e 's/\/ggml\/cmake\/FindSIMD\.cmake/\/cmake\/FindSIMD.cmake/g' \
+        -e 's/\/ggml\/src\/ggml(.*)/\/src\/ggml\1/g' \
+        -e 's/\/ggml\/src\/gguf(.*)/\/src\/gguf\1/g' \
+        -e 's/\/ggml\/include\/ggml(.*)\.h/\/include\/ggml\1.h/g' \
+        -e 's/\/ggml\/include\/gguf(.*)\.h/\/include\/gguf\1.h/g' \
         -e 's/\/examples\/common\.h/\/examples\/common.h/g' \
         -e 's/\/examples\/common\.cpp/\/examples\/common.cpp/g' \
         -e 's/\/examples\/common-ggml\.h/\/examples\/common-ggml.h/g' \
         -e 's/\/examples\/common-ggml\.cpp/\/examples\/common-ggml.cpp/g' \
-        -e 's/\/examples\/main\/main\.cpp/\/examples\/whisper\/main.cpp/g' \
-        -e 's/\/examples\/quantize\/quantize\.cpp/\/examples\/whisper\/quantize.cpp/g' \
+        -e 's/\/LICENSE/\/LICENSE/g' \
+        -e 's/\/scripts\/gen-authors\.sh/\/scripts\/gen-authors.sh/g' \
         > whisper-src.patch.tmp
     mv whisper-src.patch.tmp whisper-src.patch
 
