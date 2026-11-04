@@ -1256,20 +1256,32 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_buf_desc * bufs
             dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3]);
     }
 
-    // DMA bypasses L2. Retire dirty lines from a previous user of the destination
-    // before they can overwrite DMA output.
-    if (octx->op == HTP_OP_CPY || octx->op == HTP_OP_CPY_FENCE || octx->op == HTP_OP_CONCAT ||
-        octx->op == HTP_OP_GROUP_NORM || octx->op == HTP_OP_RMS_NORM_MUL_SILU ||
-        octx->op == HTP_OP_MODULATE || octx->op == HTP_OP_GATED_RESIDUAL) {
+    const bool norm_or_modulation = octx->op == HTP_OP_GROUP_NORM || octx->op == HTP_OP_RMS_NORM_MUL_SILU ||
+                                    octx->op == HTP_OP_MODULATE || octx->op == HTP_OP_GATED_RESIDUAL;
+    const bool leader_only = octx->ctx->mdev.count > 1 &&
+                             (norm_or_modulation || octx->op == HTP_OP_CONV_2D || octx->op == HTP_OP_QKNORM_ROPE);
+    if (leader_only) {
+        // Each peer can hold clean as well as dirty lines from a previous use
+        // of this shared buffer. Invalidate both before rank zero writes it.
+        const struct htp_tensor * dst = octx->dst;
+        if (!dst || dst->data >> 32 ||
+            qurt_mem_cache_clean((qurt_addr_t) dst->data, dst->size, QURT_MEM_CACHE_FLUSH_INVALIDATE, QURT_MEM_DCACHE) != QURT_EOK) {
+            htp_ops_context_set_status(octx, HTP_STATUS_INTERNAL_ERR);
+        }
+    } else if (norm_or_modulation || octx->op == HTP_OP_CPY || octx->op == HTP_OP_CPY_FENCE || octx->op == HTP_OP_CONCAT) {
+        // DMA bypasses L2. Retire dirty lines before they can overwrite DMA output.
         htp_dcache_flush_dirty_tensors(octx->ctx, octx->dsts, HTP_OP_MAX_OUTPUTS);
     }
-    htp_dcache_mark_dirty_tensors(octx->ctx, octx->dsts, HTP_OP_MAX_OUTPUTS);
+    const bool executes = !leader_only || octx->ctx->mdev.idx == 0;
+    if (executes) {
+        htp_dcache_mark_dirty_tensors(octx->ctx, octx->dsts, HTP_OP_MAX_OUTPUTS);
+    }
 
     htp_mdev_group_barrier(octx);
 
-    int status = execute_op(octx);
-
-    htp_ops_context_set_status(octx, status);
+    if (executes && (!leader_only || octx->status == HTP_STATUS_OK)) {
+        htp_ops_context_set_status(octx, execute_op(octx));
+    }
 
     octx->src0_spad.src = NULL;
     octx->src1_spad.src = NULL;
