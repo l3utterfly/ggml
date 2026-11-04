@@ -604,6 +604,16 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_MUL_MAT_SEGMENTED,
+        GGML_OP_QKNORM_ROPE,
+        GGML_OP_GROUP_NORM_AFFINE_SILU,
+        GGML_OP_RMS_NORM_MUL_SILU,
+        GGML_OP_MODULATE,
+        GGML_OP_GATED_RESIDUAL,
+        GGML_OP_CONV_3D_CAUSAL,
+        GGML_OP_CONV_2D_BIAS,
+        GGML_OP_CONV_2D_UPSCALE,
+
         GGML_OP_COUNT,
     };
 
@@ -1411,6 +1421,13 @@ extern "C" {
             struct ggml_tensor  * a,
             float                 eps);
 
+    GGML_API struct ggml_tensor * ggml_qknorm_rope(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * weight,
+            struct ggml_tensor  * theta,
+            float                 eps);
+
     // group normalize along ne0*ne1*n_groups
     // used in stable-diffusion
     GGML_API struct ggml_tensor * ggml_group_norm(
@@ -1424,6 +1441,51 @@ extern "C" {
             struct ggml_tensor  * a,
             int                   n_groups,
             float                 eps);
+
+    GGML_API struct ggml_tensor * ggml_group_norm_affine_silu(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * weight,
+            struct ggml_tensor  * bias,
+            int                   n_groups,
+            float                 eps);
+
+    GGML_API struct ggml_tensor * ggml_group_norm_affine_silu_inplace(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * weight,
+            struct ggml_tensor  * bias,
+            int                   n_groups,
+            float                 eps);
+
+    // RMS normalize across norm_dim, multiply by weight, then apply SiLU.
+    GGML_API struct ggml_tensor * ggml_rms_norm_mul_silu(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * weight,
+            int                   norm_dim,
+            float                 eps);
+
+    // Split ne[1] at split and apply x + x*scale + shift to each token range.
+    // If scale1 and shift1 are NULL, scale0 and shift0 are used for both ranges.
+    GGML_API struct ggml_tensor * ggml_modulate(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * scale0,
+            struct ggml_tensor  * shift0,
+            int64_t               split,
+            struct ggml_tensor  * scale1,
+            struct ggml_tensor  * shift1);
+
+    // Split ne[1] at split and apply base + branch*gate to each token range.
+    // If gate1 is NULL, gate0 is used for both ranges.
+    GGML_API struct ggml_tensor * ggml_gated_residual(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * base,
+            struct ggml_tensor  * branch,
+            struct ggml_tensor  * gate0,
+            int64_t               split,
+            struct ggml_tensor  * gate1);
 
     // l2 normalize along rows
     // used in rwkv v7
@@ -1498,6 +1560,12 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
+
+    GGML_API struct ggml_tensor * ggml_mul_mat_segmented(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b0,
+            struct ggml_tensor  * b1);
 
     // change the precision of a matrix multiplication
     // set to GGML_PREC_F32 for higher precision (useful for phi-2)
@@ -2276,6 +2344,46 @@ extern "C" {
             int                   d0,  // dilation dimension 0
             int                   d1); // dilation dimension 1
 
+    GGML_API struct ggml_tensor * ggml_conv_2d_direct_bias(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * bias,
+            int                   s0,
+            int                   s1,
+            int                   p0,
+            int                   p1,
+            int                   d0,
+            int                   d1);
+
+    GGML_API struct ggml_tensor * ggml_conv_2d_direct_upscale(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * bias,
+            int                   upscale_factor,
+            int                   s0,
+            int                   s1,
+            int                   p0,
+            int                   p1,
+            int                   d0,
+            int                   d1);
+
+    GGML_API struct ggml_tensor * ggml_conv_2d_direct_upscale_add(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * bias,
+            struct ggml_tensor  * residual,
+            int                   residual_factor_t,
+            int                   upscale_factor,
+            int                   s0,
+            int                   s1,
+            int                   p0,
+            int                   p1,
+            int                   d0,
+            int                   d1);
+
     GGML_API struct ggml_tensor * ggml_conv_3d_direct(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,   // kernel [KW, KH, KD, IC * OC]
@@ -2292,6 +2400,20 @@ extern "C" {
             int                   n_channels,
             int                   n_batch,
             int                   n_channels_out);
+
+    // Single-frame causal Conv3D. Earlier temporal taps are implicit zeroes.
+    GGML_API struct ggml_tensor * ggml_conv_3d_causal(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * bias,
+            int                   channels,
+            int                   s0,
+            int                   s1,
+            int                   p0,
+            int                   p1,
+            int                   d0,
+            int                   d1);
 
     enum ggml_op_pool {
         GGML_OP_POOL_MAX,
