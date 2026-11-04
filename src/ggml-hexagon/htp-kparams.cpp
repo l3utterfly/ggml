@@ -707,7 +707,9 @@ static bool htp_matmul_is_hmx_eligible(
         return false;
     }
 
-    if (ne00 % HTP_TENSOR_TILE_N_COLS != 0) {
+    const bool pad_flat_f16 = wtype == GGML_TYPE_F16 && !is_matmul_id && !is_batched &&
+                              ggml_is_contiguous_rows(src0) && ggml_is_contiguous_rows(src1);
+    if (ne00 % HTP_TENSOR_TILE_N_COLS != 0 && !pad_flat_f16) {
         return false;
     }
 
@@ -970,7 +972,7 @@ static bool htp_kparams_solve_matmul_impl(
 
     const bool is_tiled    = htp_tensor_is_tiled(src0);
     const int  wtype       = (is_tiled && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_BF16)) ? GGML_TYPE_F16 : src0->type;
-    const int  ne00_padded = is_tiled ? hex_round_up(ne00, htp_tensor_get_tile_k(wtype)) : ne00;
+    const int  ne00_padded = (is_tiled || wtype == GGML_TYPE_F16) ? hex_round_up(ne00, htp_tensor_get_tile_k(wtype)) : ne00;
     const int  ne11_padded = hex_round_up(ne11, 32);
     const int  ne01_tiled  = hex_round_up(ne01, 32);
 
@@ -1196,6 +1198,9 @@ bool htp_kparams_solve_mmnx(
     int32_t n_weights,
     struct htp_mm_kernel_params * kparams
 ) {
+    if (src0->ne[0] % HTP_TENSOR_TILE_N_COLS != 0) {
+        return false; // Only the single-weight HMX path pads flat F16 rows.
+    }
     const uint32_t n_threads   = htp_session_n_threads(sess);
     const uint32_t n_hmx       = htp_session_n_hmx(sess);
     const size_t   vtcm_budget = htp_session_vtcm_size(sess);

@@ -2554,7 +2554,7 @@ static void transfer_activation_chunk_threaded(const struct activation_transfer_
         return;
     }
 
-    assert(k_block % HTP_MM_HMX_TILE_N_COLS == 0 && k_stride % HTP_MM_HMX_TILE_N_COLS == 0);
+    assert(k_block % HTP_MM_HMX_TILE_N_COLS == 0);
 
     size_t n_tot_chunks      = n_rows;
     size_t n_chunks_per_task = (n_threads == 1) ? n_tot_chunks : 32;  // must be multiple of 32 to ensure correct destination address
@@ -2814,7 +2814,8 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
 
     const uint32_t dma_dst_stride  = is_tiled ? aligned_tile_size : row_stride;
     const uint32_t dma_src_stride  = is_tiled ? tile_size : weight_stride;
-    const uint32_t dma_width_bytes = is_tiled ? tile_size : row_stride;
+    const bool pad_weight = !is_tiled && weight_type == HTP_TYPE_F16 && k_valid < k;
+    const uint32_t dma_width_bytes = is_tiled ? tile_size : pad_weight ? k_valid * sizeof(__fp16) : row_stride;
 
     size_t m_chunk_n_rows = m_chunk;
     size_t n_chunk_n_cols = n_chunk;
@@ -2895,6 +2896,11 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
                 .act_elem_size = act_elem_size,
             };
             transfer_matmul_activation_chunk(&act_params, activation1 ? activation1 + (size_t) mr * stride1 * sizeof(float) : 0, k0, stride1);
+
+            if (pad_weight) {
+                hvx_splat_u8_a(vtcm_weight_raw[0], 0, L.weight_area_bytes);
+                hvx_splat_u8_a(vtcm_weight_raw[1], 0, L.weight_area_bytes);
+            }
 
             // Prologue: push A0 and optionally A1 (if n_chunk_cnt > 1)
             const size_t   n_cols_A0 = hex_smin(n - 0 * n_chunk_n_cols, n_chunk_n_cols);
@@ -3004,6 +3010,10 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
                 .act_elem_size = act_elem_size,
             };
             transfer_matmul_activation_chunk(&act_params, activation1 ? activation1 + (size_t) mr * stride1 * sizeof(float) : 0, k0, stride1);
+
+            if (pad_weight) {
+                hvx_splat_u8_a(vtcm_weight_raw[0], 0, L.weight_area_bytes);
+            }
 
             // A0: Pre-fetch the first weight chunk (nc = 0)
             if (n > 0) {
@@ -3967,7 +3977,7 @@ static int hmx_mm_op_matmul(struct htp_ops_context * octx, const struct htp_mm_k
         ret = hmx_mm_2d_f32(
             octx->ctx, octx->ctx->dma[0], dst_ptr, src2_addr, src2_bytes,
             act_addr, src0->data,
-            m_rows, k, n, act_stride, act_elem_size, (int) src0->nb[1], (int) src0->type, k,
+            m_rows, hex_align_up(k, 32), n, act_stride, act_elem_size, (int) src0->nb[1], (int) src0->type, k,
             dst_stride, src2_stride, (int)dst->ne[0],
             kparams->m_chunk, kparams->n_chunk, kparams->pipeline, n_threads,
             kparams->n_act_threads,
