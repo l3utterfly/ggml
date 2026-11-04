@@ -677,7 +677,12 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
 
     if (ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
         extra->flags |= HTP_TENSOR_WEIGHT;
-        if (htp_is_tiled_weight_tensor(tensor)) {
+        if (htp_is_conv2d_weight(tensor)) {
+            if (!(extra->flags & HTP_TENSOR_CONV2D)) {
+                memset(tensor->data, 0, htp_conv2d_weight_size(tensor));
+            }
+            extra->flags |= HTP_TENSOR_CONV2D;
+        } else if (htp_is_tiled_weight_tensor(tensor)) {
             extra->flags |= HTP_TENSOR_TILED;
         }
     }
@@ -685,6 +690,10 @@ static void ggml_backend_hexagon_buffer_set_tensor(ggml_backend_buffer_t buffer,
     HEX_VERBOSE("ggml-hex: %s set-tensor %s : data %p offset %zu size %zu usage %d flags 0x%x\n",
         sess->c_name(), tensor->name, data, offset, size, (int) buffer->usage, extra->flags);
 
+    if (extra->flags & HTP_TENSOR_CONV2D) {
+        htp_set_conv2d_weight(tensor, data, offset, size);
+        return;
+    }
     if ((extra->flags & HTP_TENSOR_TILED) == 0) {
         memcpy((char *) tensor->data + offset, data, size);
         return;
@@ -721,6 +730,10 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
     HEX_VERBOSE("ggml-hex: %s get-tensor %s : data %p offset %zu size %zu usage %d flags 0x%x\n",
             sess->c_name(), tensor->name, data, offset, size, (int) buffer->usage, extra->flags);
 
+    if (extra->flags & HTP_TENSOR_CONV2D) {
+        htp_get_conv2d_weight(data, tensor, offset, size);
+        return;
+    }
     if ((extra->flags & HTP_TENSOR_TILED) == 0) {
         memcpy(data, (const char *) tensor->data + offset, size);
         return;
@@ -754,7 +767,12 @@ static void ggml_backend_hexagon_buffer_set_tensor_2d(ggml_backend_buffer_t buff
 
     if (ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
         extra->flags |= HTP_TENSOR_WEIGHT;
-        if (htp_is_tiled_weight_tensor(tensor)) {
+        if (htp_is_conv2d_weight(tensor)) {
+            if (!(extra->flags & HTP_TENSOR_CONV2D)) {
+                memset(tensor->data, 0, htp_conv2d_weight_size(tensor));
+            }
+            extra->flags |= HTP_TENSOR_CONV2D;
+        } else if (htp_is_tiled_weight_tensor(tensor)) {
             extra->flags |= HTP_TENSOR_TILED;
         }
     }
@@ -762,6 +780,12 @@ static void ggml_backend_hexagon_buffer_set_tensor_2d(ggml_backend_buffer_t buff
     HEX_VERBOSE("ggml-hex: %s set-tensor-2d %s : data %p offset %zu size %zu n_copies %zu stride_tensor %zu stride_data %zu usage %d flags 0x%x\n",
                 sess->c_name(), tensor->name, data, offset, size, n_copies, stride_tensor, stride_data, (int) buffer->usage, extra->flags);
 
+    if (extra->flags & HTP_TENSOR_CONV2D) {
+        for (size_t i = 0; i < n_copies; ++i) {
+            htp_set_conv2d_weight(tensor, (const uint8_t *) data + i * stride_data, offset + i * stride_tensor, size);
+        }
+        return;
+    }
     if ((extra->flags & HTP_TENSOR_TILED) == 0) {
         for (size_t i = 0; i < n_copies; i++) {
             memcpy((uint8_t *) tensor->data + offset + i * stride_tensor, (const uint8_t *) data + i * stride_data, size);
@@ -800,6 +824,12 @@ static void ggml_backend_hexagon_buffer_get_tensor_2d(ggml_backend_buffer_t buff
     HEX_VERBOSE("ggml-hex: %s get-tensor-2d %s : data %p offset %zu size %zu n_copies %zu stride_tensor %zu stride_data %zu usage %d\n",
                 sess->c_name(), tensor->name, data, offset, size, n_copies, stride_tensor, stride_data, (int) buffer->usage);
 
+    if (extra->flags & HTP_TENSOR_CONV2D) {
+        for (size_t i = 0; i < n_copies; ++i) {
+            htp_get_conv2d_weight((uint8_t *) data + i * stride_data, tensor, offset + i * stride_tensor, size);
+        }
+        return;
+    }
     if ((extra->flags & HTP_TENSOR_TILED) == 0) {
         for (size_t i = 0; i < n_copies; i++) {
             memcpy((uint8_t *)data + i * stride_data, (const uint8_t *)tensor->data + offset + i * stride_tensor, size);
@@ -927,6 +957,9 @@ static size_t ggml_backend_hexagon_buffer_type_get_alignment(ggml_backend_buffer
 }
 
 static size_t ggml_backend_hexagon_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const struct ggml_tensor * t) {
+    if (!ggml_backend_buft_is_host(buft) && htp_is_conv2d_weight(t)) {
+        return htp_conv2d_weight_size(t);
+    }
     if (!ggml_backend_buft_is_host(buft) && htp_is_tiled_weight_tensor(t)) {
         int64_t ne0 = hex_round_up(t->ne[0], 32);
         int64_t ne1 = hex_round_up(t->ne[1], 32);
@@ -1317,14 +1350,14 @@ struct ggml_hexagon_opbatch {
             h.nb[1] = t->nb[1];
             h.nb[2] = t->nb[2];
             h.nb[3] = t->nb[3];
-            h.size  = ggml_nbytes(t);
+            h.size  = (extra->flags & HTP_TENSOR_CONV2D) ? htp_conv2d_weight_size(t) : ggml_nbytes(t);
         }
 
-        h.flags = extra->flags & (HTP_TENSOR_WEIGHT | HTP_TENSOR_TILED | HTP_TENSOR_FENCE);
+        h.flags = extra->flags & (HTP_TENSOR_WEIGHT | HTP_TENSOR_TILED | HTP_TENSOR_FENCE | HTP_TENSOR_CONV2D);
     }
 
     static bool same_shape(const htp_tensor & a, const htp_tensor & b) {
-        return (a.type == b.type) &&
+        return (a.type == b.type) && !((a.flags ^ b.flags) & HTP_TENSOR_CONV2D) &&
                (a.ne[0] == b.ne[0]) && (a.ne[1] == b.ne[1]) && (a.ne[2] == b.ne[2]) && (a.ne[3] == b.ne[3]) &&
                (a.nb[0] == b.nb[0]) && (a.nb[1] == b.nb[1]) && (a.nb[2] == b.nb[2]) && (a.nb[3] == b.nb[3]);
     }

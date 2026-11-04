@@ -1,5 +1,6 @@
 #include "htp-fusion.h"
 #include "htp-kparams.h"
+#include "htp/conv2d-ops.h"
 #include "ggml-impl.h"
 
 #include <algorithm>
@@ -124,6 +125,28 @@ static bool fuse_allreduce_add(const ggml_hexagon_session * sess, htp_opnode & p
     }
     prev.fused.push_back(cur.node);
     prev.set_kparams(kparams);
+    return true;
+}
+
+static bool fuse_conv2d_add(htp_opnode & prev, const htp_opnode & cur) {
+    if (prev.opcode != HTP_OP_CONV_2D || prev.inputs.size() != 3) return false;
+    auto * params = prev.kparams<htp_conv2d_kernel_params>();
+    if (!(params->flags & HTP_CONV2D_BIAS)) return false;
+
+    const ggml_tensor * residual = nullptr;
+    if (!htp_match_consumer(prev, cur, true, &residual)) return false;
+    const ggml_tensor * dst = cur.node;
+    if (dst->type != GGML_TYPE_F32 || !ggml_are_same_layout(prev.dst(), dst) ||
+        !ggml_are_same_layout(residual, dst) || htp_inplace_overlap_unsafe(dst, residual)) return false;
+    // Output tiles are written before all input halos have been consumed.
+    for (const auto * input : prev.inputs) {
+        if (htp_tensors_overlap(input, dst)) return false;
+    }
+
+    params->flags |= HTP_CONV2D_RESIDUAL;
+    prev.inputs.push_back(residual);
+    prev.outputs = { dst };
+    prev.fused.push_back(cur.node);
     return true;
 }
 
@@ -642,6 +665,7 @@ void htp_fusion_tag_graph(struct ggml_cgraph * graph) {
         if ((op == GGML_OP_RMS_NORM || op == GGML_OP_SCALE || op == GGML_OP_REPEAT ||
              op == GGML_OP_UNARY    || op == GGML_OP_ADD   || op == GGML_OP_SUB    ||
              op == GGML_OP_MUL      || op == GGML_OP_DIV   || op == GGML_OP_MUL_MAT_ID ||
+             op == GGML_OP_CONV_2D_BIAS || op == GGML_OP_CONV_2D_UPSCALE || op == GGML_OP_CONV_3D_CAUSAL ||
              op == GGML_OP_SSM_CONV || op == GGML_OP_MUL_MAT_SEGMENTED ||
              (op == GGML_OP_MUL_MAT && !htp_is_hadamard(graph->nodes[i]))) &&
             ggml_node_has_n_uses(graph, i, 1)) {
@@ -655,7 +679,8 @@ bool htp_fusion_try_fuse(const struct ggml_hexagon_session * sess, struct htp_op
 
     switch (cur.opcode) {
         case HTP_OP_ADD:
-            return (htp_fusion_enabled(HTP_FUSE_ALLREDUCE_ADD) && fuse_allreduce_add(sess, prev, cur)) ||
+            return (htp_fusion_enabled(HTP_FUSE_CONV2D_ADD)    && fuse_conv2d_add(prev, cur))                ||
+                   (htp_fusion_enabled(HTP_FUSE_ALLREDUCE_ADD) && fuse_allreduce_add(sess, prev, cur)) ||
                    (htp_fusion_enabled(HTP_FUSE_MUL_MAT_ADD)   && fuse_mul_mat_add(sess, prev, cur))   ||
                    (htp_fusion_enabled(HTP_FUSE_BINARY_NX)     && fuse_binary_nx(sess, prev, cur));
         case HTP_OP_MUL:

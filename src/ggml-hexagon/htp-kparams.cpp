@@ -2,6 +2,7 @@
 
 #include "htp-kparams.h"
 #include "htp-opnode.h"
+#include "htp-vae.h"
 #include "ggml-impl.h"
 
 #include <algorithm>
@@ -112,6 +113,13 @@ htp_op_code htp_op_remap(const struct ggml_tensor * t) {
         case GGML_OP_ARGMAX:          return HTP_OP_ARGMAX;
         case GGML_OP_MODULATE:        return HTP_OP_MODULATE;
         case GGML_OP_GATED_RESIDUAL:  return HTP_OP_GATED_RESIDUAL;
+        case GGML_OP_CONV_2D:
+        case GGML_OP_CONV_2D_BIAS:
+        case GGML_OP_CONV_2D_UPSCALE:
+        case GGML_OP_CONV_3D_CAUSAL: return HTP_OP_CONV_2D;
+        case GGML_OP_GROUP_NORM:
+        case GGML_OP_GROUP_NORM_AFFINE_SILU: return HTP_OP_GROUP_NORM;
+        case GGML_OP_RMS_NORM_MUL_SILU: return HTP_OP_RMS_NORM_MUL_SILU;
         case GGML_OP_QKNORM_ROPE:     return HTP_OP_QKNORM_ROPE;
         case GGML_OP_NORM:            return HTP_OP_NORM;
         case GGML_OP_L2_NORM:         return HTP_OP_L2_NORM;
@@ -3531,6 +3539,10 @@ bool htp_kparams_solve(
     }
 
     switch (opcode) {
+        case HTP_OP_CONV_2D:
+        case HTP_OP_GROUP_NORM:
+        case HTP_OP_RMS_NORM_MUL_SILU:
+            return htp_kparams_solve_vae(sess, op, kparams);
         case HTP_OP_QKNORM_ROPE:
             return htp_supports_qknorm_rope(op);
         case HTP_OP_MODULATE:

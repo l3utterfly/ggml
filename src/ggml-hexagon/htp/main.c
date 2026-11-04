@@ -930,6 +930,12 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_ADD_ID:
             return op_binary(octx);
 
+        case HTP_OP_CONV_2D:
+            return op_conv2d(octx);
+        case HTP_OP_GROUP_NORM:
+            return op_group_norm(octx);
+        case HTP_OP_RMS_NORM_MUL_SILU:
+            return op_rms_norm_mul_silu(octx);
         case HTP_OP_QKNORM_ROPE:
             return op_qknorm_rope(octx);
         case HTP_OP_MODULATE:

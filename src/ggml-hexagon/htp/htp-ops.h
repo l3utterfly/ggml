@@ -121,6 +121,9 @@ enum htp_op_code {
     HTP_OP_GATED_RESIDUAL,
 
     HTP_OP_MUL_MAT_SEGMENTED,
+    HTP_OP_CONV_2D,
+    HTP_OP_GROUP_NORM,
+    HTP_OP_RMS_NORM_MUL_SILU,
     HTP_OP_INVALID
 };
 
@@ -143,6 +146,7 @@ enum htp_op_code {
 enum htp_tensor_flags {
     HTP_TENSOR_WEIGHT   = (1U << 0), // Tensor buffer model weight data (not compute)
     HTP_TENSOR_TILED    = (1U << 1), // Tensor is in tiled format
+    HTP_TENSOR_CONV2D   = (1U << 4), // Packed spatial HMX weights
     HTP_TENSOR_FENCE    = (1U << 2), // Tensor is synchronization fence (explicitly managed)
     HTP_TENSOR_FUSEABLE = (1U << 3), // Tensor can be fused (host-only)
 };

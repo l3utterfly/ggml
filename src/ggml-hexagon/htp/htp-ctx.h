@@ -152,6 +152,9 @@ static inline void htp_ops_context_set_status(struct htp_ops_context * octx, int
     }
 }
 
+int op_conv2d(struct htp_ops_context * octx);
+int op_group_norm(struct htp_ops_context * octx);
+int op_rms_norm_mul_silu(struct htp_ops_context * octx);
 int op_matmul(struct htp_ops_context * octx);
 int op_matmul_segmented(struct htp_ops_context * octx);
 int op_matmul_id(struct htp_ops_context * octx);

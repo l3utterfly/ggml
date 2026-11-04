@@ -52,6 +52,8 @@ set(TARGET_NAME ggml-hexagon)
 ggml_add_backend_library(${TARGET_NAME}
     ggml-hexagon.cpp
     htp-common.h
+    htp-vae.cpp
+    htp-vae.h
     htp-kparams.cpp
     htp-kparams.h
     htp-opnode.cpp

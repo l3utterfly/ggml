@@ -1598,6 +1598,55 @@ static void repack_tiled_f8_e4m3(void * data, const ggml_tensor * t, size_t offs
     GGML_UNUSED(ne2);
 }
 
+static size_t htp_conv2d_element(const ggml_tensor * t, size_t element) {
+    const size_t area = t->ne[0] * t->ne[1];
+    const size_t ic = t->ne[2];
+    const size_t spatial = element % area;
+    const size_t channel = (element / area) % ic;
+    const size_t out = element / (area * ic);
+    const size_t tile = ((out / 32) * area + spatial) * (ic / 32) + channel / 32;
+    return tile * 1024 + ((out % 32) / 2) * 64 + (channel % 32) * 2 + (out & 1);
+}
+
+void htp_set_conv2d_weight(ggml_tensor * t, const void * data, size_t offset, size_t size) {
+    const auto * input = static_cast<const uint8_t *>(data);
+    auto * packed = static_cast<uint8_t *>(t->data);
+    if (offset == 0 && size == ggml_nbytes(t)) {
+        // Full uploads use the HMX tile traversal; the final output tile may be partial.
+        const size_t ic = t->ne[2];
+        const size_t oc = t->ne[3];
+        const size_t area = t->ne[0] * t->ne[1];
+        auto * dst = static_cast<ggml_fp16_t *>(t->data);
+        const auto * src = static_cast<const ggml_fp16_t *>(data);
+        if (oc % 32) {
+            const size_t block = (oc / 32) * 32 * area * ic;
+            memset(dst + block, 0, 32 * area * ic * sizeof(*dst));
+        }
+        for (size_t o = 0; o < oc; ++o) {
+            for (size_t s = 0; s < area; ++s) {
+                const size_t base = ((o / 32) * area + s) * (ic / 32) * 1024 + (o % 32) / 2 * 64 + (o & 1);
+                for (size_t c = 0; c < ic; ++c) {
+                    dst[base + (c / 32) * 1024 + (c % 32) * 2] = src[(o * ic + c) * area + s];
+                }
+            }
+        }
+        return;
+    }
+    for (size_t i = 0; i < size; ++i) {
+        const size_t byte = offset + i;
+        packed[2 * htp_conv2d_element(t, byte / 2) + (byte & 1)] = input[i];
+    }
+}
+
+void htp_get_conv2d_weight(void * data, const ggml_tensor * t, size_t offset, size_t size) {
+    auto * dst = static_cast<uint8_t *>(data);
+    const auto * packed = static_cast<const uint8_t *>(t->data);
+    for (size_t i = 0; i < size; ++i) {
+        const size_t byte = offset + i;
+        dst[i] = packed[2 * htp_conv2d_element(t, byte / 2) + (byte & 1)];
+    }
+}
+
 void htp_repack_tensor_tiled(ggml_tensor * tensor, const void * data, size_t size) {
     switch (tensor->type) {
         case GGML_TYPE_Q1_0:

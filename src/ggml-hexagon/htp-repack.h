@@ -67,6 +67,19 @@ static inline bool htp_is_hmx_weight_type(enum ggml_type type) {
     return htp_is_tiled_weight_type(type);
 }
 
+static inline bool htp_is_conv2d_weight(const ggml_tensor * t) {
+    return t->type == GGML_TYPE_F16 && ggml_is_contiguous(t) && !ggml_is_view(t) &&
+           ((t->ne[0] == 1 && t->ne[1] == 1) || (t->ne[0] == 3 && t->ne[1] == 3)) &&
+           t->ne[2] % 32 == 0;
+}
+
+static inline size_t htp_conv2d_weight_size(const ggml_tensor * t) {
+    return (size_t) t->ne[0] * t->ne[1] * t->ne[2] * ((t->ne[3] + 31) & ~31LL) * sizeof(ggml_fp16_t);
+}
+
+void htp_set_conv2d_weight(ggml_tensor * t, const void * data, size_t offset, size_t size);
+void htp_get_conv2d_weight(void * data, const ggml_tensor * t, size_t offset, size_t size);
+
 void htp_repack_tensor_tiled(struct ggml_tensor * t, const void * data, size_t size);
 void htp_unpack_tensor_tiled(void * data, const struct ggml_tensor * t, size_t offset, size_t size);
 
