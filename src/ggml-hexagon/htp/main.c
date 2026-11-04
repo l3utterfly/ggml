@@ -1257,8 +1257,10 @@ static int proc_op_req(struct htp_ops_context * octx, struct htp_buf_desc * bufs
     }
 
     // DMA bypasses L2. Retire dirty lines from a previous user of the destination
-    // before they can overwrite the copied bytes.
-    if (octx->op == HTP_OP_CPY || octx->op == HTP_OP_CPY_FENCE || octx->op == HTP_OP_CONCAT) {
+    // before they can overwrite DMA output.
+    if (octx->op == HTP_OP_CPY || octx->op == HTP_OP_CPY_FENCE || octx->op == HTP_OP_CONCAT ||
+        octx->op == HTP_OP_GROUP_NORM || octx->op == HTP_OP_RMS_NORM_MUL_SILU ||
+        octx->op == HTP_OP_MODULATE || octx->op == HTP_OP_GATED_RESIDUAL) {
         htp_dcache_flush_dirty_tensors(octx->ctx, octx->dsts, HTP_OP_MAX_OUTPUTS);
     }
     htp_dcache_mark_dirty_tensors(octx->ctx, octx->dsts, HTP_OP_MAX_OUTPUTS);
