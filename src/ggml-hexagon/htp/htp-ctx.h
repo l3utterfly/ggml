@@ -156,6 +156,8 @@ int op_matmul(struct htp_ops_context * octx);
 int op_matmul_id(struct htp_ops_context * octx);
 int op_matmul_nx(struct htp_ops_context * octx);
 int op_matmul_id_nx(struct htp_ops_context * octx);
+int op_qknorm_rope(struct htp_ops_context * octx);
+int op_modulation(struct htp_ops_context * octx);
 int op_binary(struct htp_ops_context * octx);
 int op_unary(struct htp_ops_context * octx);
 int op_sum(struct htp_ops_context * octx);

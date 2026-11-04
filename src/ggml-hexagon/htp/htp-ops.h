@@ -115,6 +115,10 @@ enum htp_op_code {
     HTP_OP_UNARY_CEIL,
     HTP_OP_UNARY_SGN,
 
+    HTP_OP_QKNORM_ROPE,
+    HTP_OP_MODULATE,
+    HTP_OP_GATED_RESIDUAL,
+
     HTP_OP_INVALID
 };
 

@@ -12,6 +12,81 @@
 #    define M_LOG2E 1.44269504088896340736
 #endif
 
+static bool htp_supports_qknorm_rope(const struct ggml_tensor * op) {
+    const struct ggml_tensor * src    = op->src[0];
+    const struct ggml_tensor * weight = op->src[1];
+    const struct ggml_tensor * theta  = op->src[2];
+    if (!src || !weight || !theta ||
+        src->type != GGML_TYPE_F32 || weight->type != GGML_TYPE_F32 ||
+        theta->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32) {
+        return false;
+    }
+
+    const int64_t head_dim = src->ne[0];
+    return head_dim > 0 && head_dim <= 256 && head_dim % 64 == 0 &&
+           src->ne[1] > 0 && src->ne[2] > 0 && src->ne[3] > 0 &&
+           ggml_nelements(weight) == head_dim &&
+           ggml_nelements(theta) >= src->ne[2] * 2 * head_dim &&
+           src->nb[0] == sizeof(float) &&
+           src->nb[1] % sizeof(float) == 0 &&
+           src->nb[2] % sizeof(float) == 0 &&
+           src->nb[3] % sizeof(float) == 0 &&
+           ggml_is_contiguous(weight) && ggml_is_contiguous(theta) &&
+           ggml_is_contiguous(op) && op->view_offs % 128 == 0 &&
+           op->ne[0] == head_dim && op->ne[1] == src->ne[2] &&
+           op->ne[2] == src->ne[1] * src->ne[3] && op->ne[3] == 1;
+}
+
+static bool htp_supports_modulation(const struct ggml_hexagon_session * sess, const struct ggml_tensor * op) {
+    const bool gated = op->op == GGML_OP_GATED_RESIDUAL;
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * src1 = op->src[1];
+    const ggml_tensor * param0 = op->src[gated ? 2 : 1];
+    const ggml_tensor * param1 = op->src[gated ? 3 : 2];
+
+    if (!src0 || !param0 || (!gated && !param1) ||
+        src0->type != GGML_TYPE_F32 || param0->type != GGML_TYPE_F32 ||
+        (!gated && param1->type != GGML_TYPE_F32) || op->type != GGML_TYPE_F32 ||
+        src0->ne[0] % 32 != 0 || !ggml_is_contiguous(src0) || !ggml_is_contiguous(op) ||
+        !ggml_is_contiguous(param0) || (!gated && !ggml_is_contiguous(param1)) ||
+        ggml_nelements(param0) != src0->ne[0] ||
+        (!gated && ggml_nelements(param1) != src0->ne[0]) ||
+        !ggml_are_same_shape(src0, op)) {
+        return false;
+    }
+
+    const int32_t split = ggml_get_op_params_i32(op, 0);
+    if (split < 0 || split > src0->ne[1]) {
+        return false;
+    }
+
+    if (gated) {
+        if (!src1 || src1->type != GGML_TYPE_F32 || !ggml_is_contiguous(src1) ||
+            !ggml_are_same_shape(src0, src1)) {
+            return false;
+        }
+        if (param1 && (param1->type != GGML_TYPE_F32 || !ggml_is_contiguous(param1) ||
+                       ggml_nelements(param1) != src0->ne[0])) {
+            return false;
+        }
+    } else {
+        const ggml_tensor * scale1 = op->src[3];
+        const ggml_tensor * shift1 = op->src[4];
+        if ((scale1 == nullptr) != (shift1 == nullptr)) {
+            return false;
+        }
+        if (scale1 && (scale1->type != GGML_TYPE_F32 || shift1->type != GGML_TYPE_F32 ||
+                       !ggml_is_contiguous(scale1) || !ggml_is_contiguous(shift1) ||
+                       ggml_nelements(scale1) != src0->ne[0] ||
+                       ggml_nelements(shift1) != src0->ne[0])) {
+            return false;
+        }
+    }
+    const size_t n_params = gated ? (param1 ? 2 : 1) : (op->src[3] ? 4 : 2);
+    const size_t min_rows = n_params + htp_session_n_threads(sess) * (gated ? 6 : 4);
+    return src0->ne[0] > 0 && min_rows * src0->ne[0] * sizeof(float) <= htp_session_vtcm_size(sess);
+}
+
 htp_op_code htp_op_remap(const struct ggml_tensor * t) {
     switch (t->op) {
         case GGML_OP_FLASH_ATTN_EXT:  return HTP_OP_FLASH_ATTN_EXT;
@@ -34,6 +109,9 @@ htp_op_code htp_op_remap(const struct ggml_tensor * t) {
         case GGML_OP_ARGSORT:         return HTP_OP_ARGSORT;
         case GGML_OP_TOP_K:           return HTP_OP_TOP_K;
         case GGML_OP_ARGMAX:          return HTP_OP_ARGMAX;
+        case GGML_OP_MODULATE:        return HTP_OP_MODULATE;
+        case GGML_OP_GATED_RESIDUAL:  return HTP_OP_GATED_RESIDUAL;
+        case GGML_OP_QKNORM_ROPE:     return HTP_OP_QKNORM_ROPE;
         case GGML_OP_NORM:            return HTP_OP_NORM;
         case GGML_OP_L2_NORM:         return HTP_OP_L2_NORM;
         case GGML_OP_RMS_NORM:        return HTP_OP_RMS_NORM;
@@ -3423,6 +3501,12 @@ bool htp_kparams_solve(
     }
 
     switch (opcode) {
+        case HTP_OP_QKNORM_ROPE:
+            return htp_supports_qknorm_rope(op);
+        case HTP_OP_MODULATE:
+        case HTP_OP_GATED_RESIDUAL:
+            return htp_supports_modulation(sess, op);
+
         case HTP_OP_MUL_MAT:
         case HTP_OP_MUL_MAT_ID:
             return htp_kparams_invoke<htp_kparams_solve_matmul>(sess, op, kparams);
