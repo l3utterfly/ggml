@@ -91,6 +91,7 @@ htp_op_code htp_op_remap(const struct ggml_tensor * t) {
     switch (t->op) {
         case GGML_OP_FLASH_ATTN_EXT:  return HTP_OP_FLASH_ATTN_EXT;
         case GGML_OP_MUL_MAT:         return htp_is_hadamard(t) ? HTP_OP_HADAMARD : HTP_OP_MUL_MAT;
+        case GGML_OP_MUL_MAT_SEGMENTED: return HTP_OP_MUL_MAT_SEGMENTED;
         case GGML_OP_MUL_MAT_ID:      return HTP_OP_MUL_MAT_ID;
         case GGML_OP_MUL:             return HTP_OP_MUL;
         case GGML_OP_ADD:             return HTP_OP_ADD;
@@ -703,7 +704,7 @@ static bool htp_matmul_is_hmx_eligible(
     }
 
     const bool is_tiled = htp_tensor_is_tiled(src0);
-    if (ggml_is_quantized((ggml_type) wtype) && !is_tiled) {
+    if ((ggml_is_quantized((ggml_type) wtype) || wtype == GGML_TYPE_F8_E4M3) && !is_tiled) {
         return false;
     }
     if (!is_matmul_id && is_batched && is_tiled) {
@@ -715,7 +716,7 @@ static bool htp_matmul_is_hmx_eligible(
     }
 
     const int m = is_matmul_id ? ne12 : ne11;
-    if (m <= HTP_MM_HMX_MIN_NROWS) {
+    if (m <= HTP_MM_HMX_MIN_NROWS && wtype != GGML_TYPE_F8_E4M3) {
         return false;
     }
 
@@ -976,6 +977,9 @@ static bool htp_kparams_solve_matmul_impl(
         }
     }
 
+    if (wtype == GGML_TYPE_F8_E4M3) {
+        return false; // FP8 tile layout is only consumed by the v79+ HMX kernel.
+    }
     htp_kparams_solve_hvx_mm(sess, src0, src1, dst, wtype, is_tiled, ne02, ne03, ne10, ne11, ne12, ne13, is_matmul_id, src2_row_size, vtcm_budget, kparams);
 
 finalize:
@@ -1055,6 +1059,9 @@ static bool htp_matmul_check_types(
     }
 
     switch (src0->type) {
+        case GGML_TYPE_F8_E4M3:
+            return opt_arch >= 79 && src1->type == GGML_TYPE_F32 &&
+                   htp_is_tiled_weight_tensor(src0) && src1->nb[0] == sizeof(float);
         case GGML_TYPE_Q1_0:
         case GGML_TYPE_Q2_0:
         case GGML_TYPE_Q4_0:
@@ -1105,6 +1112,29 @@ static bool htp_kparams_solve_matmul(
         return htp_kparams_solve_matmul_impl(sess, src0, &src1_collapsed, &dst_collapsed, 0, 0, kparams);
     }
     return htp_kparams_solve_matmul_impl(sess, src0, src1, dst, 0, 0, kparams);
+}
+
+static bool htp_kparams_solve_matmul_segmented(
+    const ggml_hexagon_session * sess, const ggml_tensor * op, htp_mm_kernel_params * kparams
+) {
+    const ggml_tensor * w = op->src[0];
+    const ggml_tensor * a = op->src[1];
+    const ggml_tensor * b = op->src[2];
+    if (!w || !a || !b || (w->type != GGML_TYPE_F8_E4M3 && w->type != GGML_TYPE_Q4_0 && w->type != GGML_TYPE_MXFP4) ||
+        (w->type == GGML_TYPE_F8_E4M3 && opt_arch < 79) || !htp_tensor_is_tiled(w) ||
+        a->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || op->type != GGML_TYPE_F32 ||
+        !ggml_is_matrix(w) || !ggml_is_matrix(a) || !ggml_is_matrix(b) || !ggml_is_matrix(op) ||
+        w->ne[0] != a->ne[0] + b->ne[0] || w->ne[1] != op->ne[0] ||
+        a->ne[1] != b->ne[1] || a->ne[1] != op->ne[1] || a->ne[0] % 32 || b->ne[0] % 32 ||
+        !ggml_is_contiguous_rows(a) || !ggml_is_contiguous_rows(b) || !ggml_is_contiguous_rows(op)) {
+        return false;
+    }
+    ggml_tensor joined = *a;
+    joined.ne[0] = w->ne[0];
+    joined.nb[1] = joined.ne[0] * sizeof(float);
+    joined.nb[2] = joined.ne[1] * joined.nb[1];
+    joined.nb[3] = joined.nb[2];
+    return htp_kparams_solve_matmul_impl(sess, w, &joined, op, 0, 0, kparams) && kparams->n_hmx;
 }
 
 bool htp_matmul_add_can_collapse(
@@ -3506,6 +3536,8 @@ bool htp_kparams_solve(
         case HTP_OP_MODULATE:
         case HTP_OP_GATED_RESIDUAL:
             return htp_supports_modulation(sess, op);
+        case HTP_OP_MUL_MAT_SEGMENTED:
+            return htp_kparams_invoke<htp_kparams_solve_matmul_segmented>(sess, op, kparams);
 
         case HTP_OP_MUL_MAT:
         case HTP_OP_MUL_MAT_ID:

@@ -14,6 +14,7 @@
 #define HTP_TENSOR_TILE_N_COLS      32
 #define HTP_TENSOR_TILE_N_ROWS      32
 
+#define HTP_TENSOR_TILE_SIZE_F8_E4M3 1024
 #define HTP_TENSOR_TILE_SIZE_F16    2048
 #define HTP_TENSOR_TILE_SIZE_Q4_0   576
 #define HTP_TENSOR_TILE_SIZE_Q4_1   640
@@ -152,6 +153,7 @@ static inline uint32_t htp_tensor_get_tile_size(int type) {
         case HTP_TYPE_Q1_0:   return HTP_TENSOR_TILE_SIZE_Q1_0;
         case HTP_TYPE_Q2_0:   return HTP_TENSOR_TILE_SIZE_Q2_0;
         case HTP_TYPE_MXFP4:  return HTP_TENSOR_TILE_SIZE_MXFP4;
+        case HTP_TYPE_F8_E4M3: return HTP_TENSOR_TILE_SIZE_F8_E4M3;
         case HTP_TYPE_F16:    return HTP_TENSOR_TILE_SIZE_F16;
         default:              return 0;
     }
@@ -175,6 +177,7 @@ static inline bool htp_tensor_is_tiled(const struct htp_tensor * t) {
 
 static inline uint32_t htp_tensor_get_row_size(int type, uint32_t ne00) {
     switch (type) {
+        case HTP_TYPE_F8_E4M3: return ne00;
         case HTP_TYPE_F32:    return ne00 * 4;
         case HTP_TYPE_F16:
         case HTP_TYPE_BF16:   return ne00 * 2;

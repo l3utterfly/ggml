@@ -10,6 +10,7 @@
 static inline bool htp_is_tiled_weight_type(enum ggml_type type) {
     return type == GGML_TYPE_Q4_0  || type == GGML_TYPE_Q4_1   ||
            type == GGML_TYPE_Q8_0  || type == GGML_TYPE_IQ4_NL ||
+           type == GGML_TYPE_F8_E4M3 ||
            type == GGML_TYPE_MXFP4 || type == GGML_TYPE_Q1_0   ||
            type == GGML_TYPE_Q6_K   ||
            type == GGML_TYPE_Q4_K  || type == GGML_TYPE_Q5_K   ||
@@ -28,6 +29,9 @@ static inline bool htp_is_tiled_weight_tensor(const struct ggml_tensor * t) {
     }
     if (t->ne[0] < 32) {
         return false;
+    }
+    if (t->type == GGML_TYPE_F8_E4M3) {
+        return t->ne[0] % 32 == 0 && t->ne[2] == 1 && t->ne[3] == 1;
     }
     if (!ggml_is_quantized(t->type)) {
         return (t->ne[0] % 32 == 0) && (t->ne[1] % 32 == 0) && (t->ne[2] == 1) && (t->ne[3] == 1);

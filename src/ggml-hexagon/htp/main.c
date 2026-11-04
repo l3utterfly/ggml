@@ -911,6 +911,9 @@ static int execute_op(struct htp_ops_context * octx) {
         case HTP_OP_MUL_MAT_ADD:
             return op_matmul(octx);
 
+        case HTP_OP_MUL_MAT_SEGMENTED:
+            return op_matmul_segmented(octx);
+
         case HTP_OP_MUL_MAT_ID:
             return op_matmul_id(octx);
 

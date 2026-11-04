@@ -2393,7 +2393,8 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
             }
 
             htp_opnode node(opcode, n);
-            if (node.opcode == HTP_OP_MUL_MAT || node.opcode == HTP_OP_MUL_MAT_ID || node.opcode == HTP_OP_GET_ROWS) {
+            if (node.opcode == HTP_OP_MUL_MAT || node.opcode == HTP_OP_MUL_MAT_ID ||
+                node.opcode == HTP_OP_MUL_MAT_SEGMENTED || node.opcode == HTP_OP_GET_ROWS) {
                 ggml_tensor * src0 = node.node->src[0];
                 if (htp_needs_repack(src0)) {
                     HEX_VERBOSE("ggml-hex: %s rt-repack %s|size %zu\n", sess->c_name(), htp_format_tensor(src0, HTP_OPFMT_TENSOR).c_str(), ggml_nbytes(src0));
@@ -3382,6 +3383,8 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
     static_assert((unsigned int) HTP_TYPE_Q2_K == (unsigned int) GGML_TYPE_Q2_K,
                   "please update hexagon_type to match ggml_type");
     static_assert((unsigned int) HTP_TYPE_Q1_0 == (unsigned int) GGML_TYPE_Q1_0,
+                  "please update hexagon_type to match ggml_type");
+    static_assert((unsigned int) HTP_TYPE_F8_E4M3 == (unsigned int) GGML_TYPE_F8_E4M3,
                   "please update hexagon_type to match ggml_type");
     static_assert((unsigned int) HTP_TYPE_Q2_0 == (unsigned int) GGML_TYPE_Q2_0,
                   "please update hexagon_type to match ggml_type");

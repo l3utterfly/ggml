@@ -34,6 +34,7 @@ enum htp_data_type {
     HTP_TYPE_MXFP4  = 39,
     HTP_TYPE_Q1_0   = 41,
     HTP_TYPE_Q2_0   = 42,
+    HTP_TYPE_F8_E4M3 = 43,
 
     HTP_TYPE_INVALID
 };
@@ -119,6 +120,7 @@ enum htp_op_code {
     HTP_OP_MODULATE,
     HTP_OP_GATED_RESIDUAL,
 
+    HTP_OP_MUL_MAT_SEGMENTED,
     HTP_OP_INVALID
 };
 

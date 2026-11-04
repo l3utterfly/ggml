@@ -1526,6 +1526,78 @@ static void repack_tiled_q1_0(void * data, const ggml_tensor * t, size_t offset,
 
 // --- Top-level Repack / Unpack Dispatchers ---
 
+static inline size_t f8_e4m3_tile_offset(int row, int col) {
+    static const uint8_t lane[4] = { 0, 2, 1, 3 };
+    const int tile_row = (col / 4) * 4 + row / 8;
+    const int tile_col = (row % 8) * 4 + lane[col % 4];
+    return (size_t) tile_row * 32 + tile_col;
+}
+
+static void repack_f8_e4m3_tiled(ggml_tensor * t, const void * data, size_t size) {
+    GGML_ASSERT(size == ggml_nbytes(t));
+
+    const uint8_t * src = (const uint8_t *) data;
+    const int64_t ne0 = t->ne[0];
+    const int64_t ne1 = t->ne[1];
+    const int64_t ne2 = t->ne[2];
+    const int64_t ne3 = t->ne[3];
+    const int64_t ne0_padded = hex_round_up(ne0, 32);
+    const int64_t ne1_padded = hex_round_up(ne1, 32);
+    const int n_k_tiles = ne0_padded / 32;
+    const int n_col_tiles = ne1_padded / 32;
+    const size_t matrix_size = (size_t) n_col_tiles * n_k_tiles * HTP_TENSOR_TILE_SIZE_F8_E4M3;
+
+    for (int64_t i3 = 0; i3 < ne3; ++i3) {
+        for (int64_t i2 = 0; i2 < ne2; ++i2) {
+            const uint8_t * matrix_src = src + (i3 * ne2 + i2) * ne1 * ne0;
+            uint8_t * matrix_dst = (uint8_t *) t->data + (i3 * ne2 + i2) * matrix_size;
+
+            for (int ct = 0; ct < n_col_tiles; ++ct) {
+                for (int kt = 0; kt < n_k_tiles; ++kt) {
+                    uint8_t * tile = matrix_dst + ((size_t) ct * n_k_tiles + kt) * HTP_TENSOR_TILE_SIZE_F8_E4M3;
+                    for (int row = 0; row < 32; ++row) {
+                        const int64_t j = (int64_t) ct * 32 + row;
+                        for (int col = 0; col < 32; ++col) {
+                            const int64_t i = (int64_t) kt * 32 + col;
+                            const uint8_t value = i < ne0 && j < ne1 ? matrix_src[j * ne0 + i] : 0;
+                            tile[f8_e4m3_tile_offset(row, col)] = value == 0x80 ? 0 : value;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void repack_tiled_f8_e4m3(void * data, const ggml_tensor * t, size_t offset, size_t size) {
+    GGML_ASSERT(offset + size <= ggml_nbytes(t));
+
+    uint8_t * dst = (uint8_t *) data;
+    const int64_t ne0 = t->ne[0];
+    const int64_t ne1 = t->ne[1];
+    const int64_t ne2 = t->ne[2];
+    const int64_t ne0_padded = hex_round_up(ne0, 32);
+    const int64_t ne1_padded = hex_round_up(ne1, 32);
+    const int n_k_tiles = ne0_padded / 32;
+    const int n_col_tiles = ne1_padded / 32;
+    const size_t matrix_size = (size_t) n_col_tiles * n_k_tiles * HTP_TENSOR_TILE_SIZE_F8_E4M3;
+    const size_t slice_size = (size_t) ne0 * ne1;
+
+    for (size_t p = 0; p < size; ++p) {
+        const size_t index = offset + p;
+        const size_t slice = index / slice_size;
+        const size_t in_slice = index - slice * slice_size;
+        const int row = in_slice / ne0;
+        const int col = in_slice - (size_t) row * ne0;
+        const int ct = row / 32;
+        const int kt = col / 32;
+        const uint8_t * tile = (const uint8_t *) t->data + slice * matrix_size + ((size_t) ct * n_k_tiles + kt) * HTP_TENSOR_TILE_SIZE_F8_E4M3;
+        dst[p] = tile[f8_e4m3_tile_offset(row % 32, col % 32)];
+    }
+
+    GGML_UNUSED(ne2);
+}
+
 void htp_repack_tensor_tiled(ggml_tensor * tensor, const void * data, size_t size) {
     switch (tensor->type) {
         case GGML_TYPE_Q1_0:
@@ -1561,6 +1633,9 @@ void htp_repack_tensor_tiled(ggml_tensor * tensor, const void * data, size_t siz
             break;
         case GGML_TYPE_Q6_K:
             repack_q6_K_tiled(tensor, data, 0, size);
+            break;
+        case GGML_TYPE_F8_E4M3:
+            repack_f8_e4m3_tiled(tensor, data, size);
             break;
         case GGML_TYPE_F16:
             repack_float_to_f16_tiled<uint16_t>(tensor, data, 0, size,
@@ -1616,6 +1691,9 @@ void htp_unpack_tensor_tiled(void * data, const ggml_tensor * tensor, size_t off
             break;
         case GGML_TYPE_Q6_K:
             repack_tiled_q6_K(data, tensor, offset, size);
+            break;
+        case GGML_TYPE_F8_E4M3:
+            repack_tiled_f8_e4m3(data, tensor, offset, size);
             break;
         case GGML_TYPE_F16:
             unpack_f16_tiled_to_float<uint16_t>(data, tensor, offset, size,

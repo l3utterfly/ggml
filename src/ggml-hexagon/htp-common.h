@@ -58,7 +58,7 @@ static inline bool htp_can_rt_repack(const struct ggml_tensor * t) {
     if (t->buffer && ggml_backend_buft_is_host(t->buffer->buft)) {
         return false;
     }
-    return opt_rt_repack > 1 || ggml_is_quantized(t->type);
+    return opt_rt_repack > 1 || ggml_is_quantized(t->type) || t->type == GGML_TYPE_F8_E4M3;
 }
 
 static inline bool htp_tensor_is_tiled(const struct ggml_tensor * t) {

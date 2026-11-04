@@ -1039,6 +1039,80 @@ static void core_dot_chunk_fp16(__fp16 *restrict output, const __fp16 *restrict 
     }
 }
 
+#if defined(__HEXAGON_ARCH__) && (__HEXAGON_ARCH__ >= 79)
+static inline void core_dot_tile_fp16_f8(__fp16 *restrict output,
+                                         const __fp16 *restrict activation,
+                                         const uint8_t *restrict weight,
+                                         uint32_t n_dot_tiles) {
+    asm volatile(HMX_CLRACC_F16());
+    for (uint32_t kt = 0; kt < n_dot_tiles; kt += 32) {
+        const uint32_t count = hex_smin(32, n_dot_tiles - kt);
+        const uint32_t act_range = count * HTP_MM_HMX_TILE_SIZE - 1;
+        const uint32_t weight_range = count * HTP_TENSOR_TILE_SIZE_F8_E4M3 - 1;
+        asm volatile(
+            "{\n"
+            "    activation.hf = mxmem(%0, %1):deep\n"
+            "    weight.f8 = mxmem(%2, %3)\n"
+            "}\n"
+            :: "r"(activation), "r"(act_range), "r"(weight), "r"(weight_range));
+        activation += (size_t) count * HTP_MM_HMX_TILE_N_ELMS;
+        weight += (size_t) count * HTP_TENSOR_TILE_SIZE_F8_E4M3;
+    }
+    asm volatile(
+        "cvt.hf = acc(%0)\n"
+        "mxmem(%1, %2) = cvt\n"
+        :: "r"(2), "r"(output), "r"(0) : "memory");
+}
+#endif
+
+static void core_dot_chunk_fp16_f8(__fp16 *restrict output, const __fp16 *restrict activation,
+                                   const uint8_t *restrict weight, const __fp16 *restrict scales,
+                                   bool per_channel_scales,
+                                   uint32_t n_row_tiles, uint32_t n_col_tiles, uint32_t n_dot_tiles) {
+#if defined(__HEXAGON_ARCH__) && (__HEXAGON_ARCH__ >= 79)
+    __builtin_assume(n_row_tiles > 0);
+    __builtin_assume(n_col_tiles > 0);
+    __builtin_assume(n_dot_tiles > 0);
+
+    const size_t act_dot_stride = (size_t) n_dot_tiles * HTP_MM_HMX_TILE_N_ELMS;
+    const size_t weight_dot_stride = (size_t) n_dot_tiles * HTP_TENSOR_TILE_SIZE_F8_E4M3;
+
+    if (per_channel_scales) {
+        for (uint32_t c = 0; c < n_col_tiles; ++c) {
+            const __fp16 * scale_block = scales + (size_t) c * HTP_MM_HMX_SCALE_BLOCK_SIZE / sizeof(__fp16);
+            asm volatile(HMX_SET_BIAS("%0") :: "r"((unsigned int) scale_block));
+            for (uint32_t r = 0; r < n_row_tiles; ++r) {
+                core_dot_tile_fp16_f8(
+                    output + ((size_t) r * n_col_tiles + c) * HTP_MM_HMX_TILE_N_ELMS,
+                    activation + (size_t) r * act_dot_stride,
+                    weight + (size_t) c * weight_dot_stride,
+                    n_dot_tiles);
+            }
+        }
+    } else {
+        asm volatile(HMX_SET_BIAS("%0") :: "r"((unsigned int) scales));
+        for (uint32_t r = 0; r < n_row_tiles; ++r) {
+            for (uint32_t c = 0; c < n_col_tiles; ++c) {
+                core_dot_tile_fp16_f8(
+                    output + ((size_t) r * n_col_tiles + c) * HTP_MM_HMX_TILE_N_ELMS,
+                    activation + (size_t) r * act_dot_stride,
+                    weight + (size_t) c * weight_dot_stride,
+                    n_dot_tiles);
+            }
+        }
+    }
+#else
+    (void) output;
+    (void) activation;
+    (void) weight;
+    (void) scales;
+    (void) per_channel_scales;
+    (void) n_row_tiles;
+    (void) n_col_tiles;
+    (void) n_dot_tiles;
+#endif
+}
+
 static void core_mma_chunk_fp16_short(__fp16 *restrict c, const __fp16 *restrict a, const __fp16 *restrict b,
                                 const __fp16 *restrict col_scales, const __fp16 *restrict eye_tile,
                                 uint32_t n_row_tiles, uint32_t n_col_tiles, uint32_t n_dot_tiles, bool zero_init) {
@@ -1140,11 +1214,13 @@ static void transfer_output_chunk_fp16_to_fp32_col_chunk(
     uint32_t total_n_cols,
     uint32_t dst_stride,
     uint32_t src2_stride,
-    uint32_t dst_cols
+    uint32_t dst_cols,
+    float output_scale
 ) {
     const size_t tile_row_stride = hmx_ceil_div(total_n_cols, HTP_MM_HMX_TILE_N_COLS) * HTP_MM_HMX_TILE_N_ELMS;
 
     const HVX_Vector one = hvx_vec_splat_f16(1.0);
+    const HVX_Vector scale = hvx_vec_splat_f32(output_scale);
 
     const size_t limit_c         = hex_smin(c_len, dst_cols);
     const size_t limit_c_aligned = (limit_c & ~31);
@@ -1165,6 +1241,7 @@ static void transfer_output_chunk_fp16_to_fp32_col_chunk(
             HVX_VectorPair vp = Q6_Wqf32_vmpy_VhfVhf(v, one);
 
             HVX_Vector v_out0 = Q6_Vsf_equals_Vqf32(Q6_V_lo_W(vp));
+            if (output_scale != 1.0f) v_out0 = hvx_vec_mul_f32_f32(v_out0, scale);
             if (src2_row_base) {
                 HVX_Vector v_src2_0 = hvx_vmemu(src2_row_base + c + 0);
                 v_out0 = hvx_vec_add_f32_f32(v_out0, v_src2_0);
@@ -1173,6 +1250,7 @@ static void transfer_output_chunk_fp16_to_fp32_col_chunk(
 
             if (r + 1 < n_rows) {
                 HVX_Vector v_out1 = Q6_Vsf_equals_Vqf32(Q6_V_hi_W(vp));
+                if (output_scale != 1.0f) v_out1 = hvx_vec_mul_f32_f32(v_out1, scale);
                 if (src2_row_base) {
                     HVX_Vector v_src2_1 = hvx_vmemu(src2_row_base + c + src2_stride);
                     v_out1 = hvx_vec_add_f32_f32(v_out1, v_src2_1);
@@ -1190,6 +1268,7 @@ static void transfer_output_chunk_fp16_to_fp32_col_chunk(
             HVX_VectorPair vp = Q6_Wqf32_vmpy_VhfVhf(v, one);
 
             HVX_Vector v_out0 = Q6_Vsf_equals_Vqf32(Q6_V_lo_W(vp));
+            if (output_scale != 1.0f) v_out0 = hvx_vec_mul_f32_f32(v_out0, scale);
             if (src2_row_base) {
                 HVX_Vector v_src2_0 = hvx_vmemu(src2_row_base + c + 0);
                 v_out0 = hvx_vec_add_f32_f32(v_out0, v_src2_0);
@@ -1198,6 +1277,7 @@ static void transfer_output_chunk_fp16_to_fp32_col_chunk(
 
             if (r + 1 < n_rows) {
                 HVX_Vector v_out1 = Q6_Vsf_equals_Vqf32(Q6_V_hi_W(vp));
+                if (output_scale != 1.0f) v_out1 = hvx_vec_mul_f32_f32(v_out1, scale);
                 if (src2_row_base) {
                     HVX_Vector v_src2_1 = hvx_vmemu(src2_row_base + c + src2_stride);
                     v_out1 = hvx_vec_add_f32_f32(v_out1, v_src2_1);
@@ -1217,10 +1297,11 @@ static inline void transfer_output_chunk_fp16_to_fp32(
     uint32_t n_cols,
     uint32_t dst_stride,
     uint32_t src2_stride,
-    uint32_t dst_cols
+    uint32_t dst_cols,
+    float output_scale
 ) {
     transfer_output_chunk_fp16_to_fp32_col_chunk(
-        dst, src2, vtcm_src, start_row, n_rows, n_cols, n_cols, dst_stride, src2_stride, dst_cols
+        dst, src2, vtcm_src, start_row, n_rows, n_cols, n_cols, dst_stride, src2_stride, dst_cols, output_scale
     );
 }
 
@@ -1235,6 +1316,7 @@ typedef struct {
     uint32_t       dst_stride;  // DDR row stride
     uint32_t       src2_stride; // DDR row stride for residual
     uint32_t       dst_cols;    // Actual output columns
+    float          output_scale;
     struct htp_thread_trace * traces;
 } output_transfer_task_state_t;
 
@@ -1375,8 +1457,8 @@ static void transfer_activation_row_pair_fp32_to_fp16_col_chunk(
     for (; c + 32 <= k_chunk_valid; c += 32) {
         HVX_Vector v0 = Q6_V_vzero();
         HVX_Vector v1 = Q6_V_vzero();
-        if (row0_valid) v0 = *(const HVX_Vector *)(row0 + c);
-        if (row1_valid) v1 = *(const HVX_Vector *)(row1 + c);
+        if (row0_valid) v0 = hvx_vmemu(row0 + c);
+        if (row1_valid) v1 = hvx_vmemu(row1 + c);
 
         HVX_Vector v_out = hvx_vec_f32_to_f16_shuff(v0, v1);
 
@@ -1389,8 +1471,8 @@ static void transfer_activation_row_pair_fp32_to_fp16_col_chunk(
     if (c < c_len) {
         HVX_Vector v0 = Q6_V_vzero();
         HVX_Vector v1 = Q6_V_vzero();
-        if (row0_valid) v0 = *(const HVX_Vector *)(row0 + c);
-        if (row1_valid) v1 = *(const HVX_Vector *)(row1 + c);
+        if (row0_valid) v0 = hvx_vmemu(row0 + c);
+        if (row1_valid) v1 = hvx_vmemu(row1 + c);
 
         uint32_t rem = (k_chunk_valid > c) ? (k_chunk_valid - c) : 0;
         HVX_VectorPred mask = Q6_Q_vsetq2_R(rem > 0 ? rem * sizeof(float) : 0);

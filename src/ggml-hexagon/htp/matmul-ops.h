@@ -57,11 +57,18 @@ enum htp_mm_kernel_type {
     HTP_MM_KERNEL_HVX_QUANT_BLOCK,    // parallel block-wise quantization
 };
 
+enum htp_mm_scale_flags {
+    HTP_MM_SCALE_PARAM  = 1u << 0,
+    HTP_MM_SCALE_TENSOR = 1u << 1,
+};
+
+#define HTP_MM_HMX_SCALE_BLOCK_SIZE 256
+
 // Op-specific struct for precomputed matmul params
 struct htp_mm_kernel_params {
     uint8_t  kernel_type;        // enum htp_mm_kernel_type
     uint8_t  pipeline;           // 1 = pipelined execution, 0 = standard
-    uint8_t  unused;             // reserved
+    uint8_t  scale_flags;        // enum htp_mm_scale_flags
     uint8_t  n_hmx;              // 1 = use HMX, 0 = use HVX
 
     uint8_t  n_threads;          // Number of threads to spawn
@@ -237,7 +244,7 @@ static inline void htp_mm_hmx_get_2d_chunk_costs(
     const size_t qweight_row_stride = is_quant ? (size_t)(n_weight_tiles * aligned_tile_size) / 32 : 0;
 
     *size_per_n_out = (pipeline ? 2 : 1) * (is_quant ? qweight_row_stride : row_stride) +
-                      (pipeline ? 2 * vec_dot_size : vec_dot_size);
+                      (pipeline ? 2 : 1) * (wtype == HTP_TYPE_F8_E4M3 ? HTP_MM_HMX_SCALE_BLOCK_SIZE / 32 : vec_dot_size);
     *size_per_m_out = vec_dot_size;
     *size_per_mn_out = (pipeline ? 2 : 1) * sizeof(uint16_t);
 }
@@ -374,12 +381,14 @@ static inline void htp_mm_hmx_vtcm_layout_build(
         const size_t act_area_size    = hex_align_up(mc * vec_dot_size, HTP_MM_HMX_TILE_SIZE);
         const size_t output_area_size = hex_align_up(mc * nc * sizeof(__fp16), HTP_MM_HMX_TILE_SIZE);
 
-        const size_t scratch0_size = hex_align_up(nc * vec_dot_size, HTP_MM_HMX_TILE_SIZE);
+        const bool direct_f8 = wtype == HTP_TYPE_F8_E4M3;
+        const size_t scale_bytes = direct_f8 ? hex_align_up((nc / 32) * HTP_MM_HMX_SCALE_BLOCK_SIZE * (pipeline ? 2 : 1), HTP_MM_HMX_TILE_SIZE) : HTP_MM_HMX_TILE_SIZE;
+        const size_t scratch0_size = direct_f8 ? 0 : hex_align_up(nc * vec_dot_size, HTP_MM_HMX_TILE_SIZE);
         const size_t scratch1_size = pipeline ? scratch0_size : 0;
 
         // Group A:  Scales and activation tiles (must not overlap with Group B or C)
         size_t off_group_a = 0;
-        VTCM_LAYOUT_ALLOC(off_group_a, off_scales, HTP_MM_HMX_TILE_SIZE); // Padded to 2K for alignment and future persistent data
+        VTCM_LAYOUT_ALLOC(off_group_a, off_scales, scale_bytes);
         VTCM_LAYOUT_ALLOC(off_group_a, off_act, act_area_size);
         VTCM_LAYOUT_ALLOC_OPTIONAL(off_group_a, off_bias, hex_align_up(bias_size, HTP_MM_HMX_TILE_SIZE), bias_size > 0);
 
