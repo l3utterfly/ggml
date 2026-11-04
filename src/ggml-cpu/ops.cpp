@@ -2,6 +2,7 @@
 
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
+#include "ggml-quants.h"
 #include "binary-ops.h"
 #include "simd-gemm.h"
 #include "ggml.h"
@@ -11,6 +12,32 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+
+struct ggml_fp8_e4m3_cpu {
+    uint8_t value;
+};
+
+struct ggml_fp8_e5m2_cpu {
+    uint8_t value;
+};
+
+static float fp8_e4m3_to_f32(ggml_fp8_e4m3_cpu value) {
+    return ggml_fp8_e4m3_to_fp32(value.value);
+}
+
+static float fp8_e5m2_to_f32(ggml_fp8_e5m2_cpu value) {
+    return ggml_fp8_e5m2_to_fp32(value.value);
+}
+
+template<>
+struct type_conversion_table<ggml_fp8_e4m3_cpu> {
+    static constexpr float (*to_f32)(ggml_fp8_e4m3_cpu) = fp8_e4m3_to_f32;
+};
+
+template<>
+struct type_conversion_table<ggml_fp8_e5m2_cpu> {
+    static constexpr float (*to_f32)(ggml_fp8_e5m2_cpu) = fp8_e5m2_to_f32;
+};
 
 // ggml_compute_forward_dup
 
@@ -541,6 +568,20 @@ void ggml_compute_forward_dup(
                 else if (dst->type == GGML_TYPE_BF16) ggml_compute_forward_dup_flt<ggml_fp16_t, ggml_bf16_t>(params, dst);
                 else if (dst->type == GGML_TYPE_F32)  ggml_compute_forward_dup_flt<ggml_fp16_t, float      >(params, dst);
                 else ggml_compute_forward_dup_to_q<ggml_fp16_t>(params, dst);
+            } break;
+        case GGML_TYPE_F8_E4M3:
+            {
+                /**/ if (dst->type == GGML_TYPE_F16)  ggml_compute_forward_dup_flt<ggml_fp8_e4m3_cpu, ggml_fp16_t>(params, dst);
+                else if (dst->type == GGML_TYPE_BF16) ggml_compute_forward_dup_flt<ggml_fp8_e4m3_cpu, ggml_bf16_t>(params, dst);
+                else if (dst->type == GGML_TYPE_F32)  ggml_compute_forward_dup_flt<ggml_fp8_e4m3_cpu, float>(params, dst);
+                else GGML_ABORT("unsupported FP8 E4M3 conversion");
+            } break;
+        case GGML_TYPE_F8_E5M2:
+            {
+                /**/ if (dst->type == GGML_TYPE_F16)  ggml_compute_forward_dup_flt<ggml_fp8_e5m2_cpu, ggml_fp16_t>(params, dst);
+                else if (dst->type == GGML_TYPE_BF16) ggml_compute_forward_dup_flt<ggml_fp8_e5m2_cpu, ggml_bf16_t>(params, dst);
+                else if (dst->type == GGML_TYPE_F32)  ggml_compute_forward_dup_flt<ggml_fp8_e5m2_cpu, float>(params, dst);
+                else GGML_ABORT("unsupported FP8 E5M2 conversion");
             } break;
         case GGML_TYPE_BF16:
             {
@@ -10440,6 +10481,36 @@ void ggml_compute_forward_unary(
     }
 }
 
+static void ggml_compute_forward_situ(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous_1(src0) && ggml_is_contiguous(dst));
+    GGML_ASSERT(src1 == nullptr || (src1->type == GGML_TYPE_F32 && ggml_is_contiguous_1(src1)));
+    const int64_t columns    = dst->ne[0];
+    const int64_t rows       = ggml_nrows(dst);
+    const int64_t per_thread = (rows + params->nth - 1) / params->nth;
+    const int64_t begin      = per_thread * params->ith;
+    const int64_t end        = std::min(begin + per_thread, rows);
+    const bool    swapped    = ggml_get_op_params_i32(dst, 1) != 0;
+    for (int64_t row = begin; row < end; ++row) {
+        const float * gate = reinterpret_cast<const float *>(static_cast<const char *>(src0->data) + row * src0->nb[1]);
+        const float * up   = reinterpret_cast<const float *>(static_cast<const char *>(src1 ? src1->data : src0->data) +
+                                                             row * (src1 ? src1->nb[1] : src0->nb[1]));
+        if (src1 == nullptr) {
+            gate += swapped ? columns : 0;
+            up += swapped ? 0 : columns;
+        }
+        float * output = static_cast<float *>(dst->data) + row * columns;
+        for (int64_t col = 0; col < columns; ++col) {
+            const float g = gate[col];
+            const float a = tanhf(0.25f * g) * 4.0f;
+            const float b = tanhf((1.0f / 25.0f) * up[col]) * 25.0f;
+            output[col]   = (a * (1.0f / (1.0f + expf(-g)))) * b;
+        }
+    }
+}
+
 //ggml_compute_forward_glu
 
 void ggml_compute_forward_glu(
@@ -10476,6 +10547,10 @@ void ggml_compute_forward_glu(
         case GGML_GLU_OP_SWIGLU_CLAMP:
             {
                 ggml_compute_forward_swiglu_clamp(params, dst);
+            } break;
+        case GGML_GLU_OP_SITU:
+            {
+                ggml_compute_forward_situ(params, dst);
             } break;
         default:
             {

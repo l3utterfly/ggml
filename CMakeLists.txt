@@ -329,6 +329,9 @@ set(GGML_PUBLIC_HEADERS
     include/ggml-cpu.h
     include/ggml-alloc.h
     include/ggml-backend.h
+    include/ggml-ext.h
+    include/ggml-graph.h
+    include/ggml-ext-vulkan.h
     include/ggml-blas.h
     include/ggml-cann.h
     include/ggml-cpp.h

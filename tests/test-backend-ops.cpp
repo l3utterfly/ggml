@@ -10142,11 +10142,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_top_k_mask(type, 512, 8, 16, 32, 7, true, 5, 1, 4, false, true));
     }
 
+    for (int v : { 0, 1 }) {
+        for (bool swapped : { false, true }) {
+            test_cases.emplace_back(new test_glu(GGML_GLU_OP_SITU, GGML_TYPE_F32, { 2, 5, 3, 2 }, v, swapped));
+            test_cases.emplace_back(new test_glu(GGML_GLU_OP_SITU, GGML_TYPE_F32, { 10, 7, 11, 13 }, v, swapped));
+            test_cases.emplace_back(new test_glu(GGML_GLU_OP_SITU, GGML_TYPE_F32, { 16384, 17, 1, 1 }, v, swapped));
+        }
+        test_cases.emplace_back(new test_glu_split(GGML_GLU_OP_SITU, GGML_TYPE_F32, { 1, 5, 3, 2 }, v));
+        test_cases.emplace_back(new test_glu_split(GGML_GLU_OP_SITU, GGML_TYPE_F32, { 5, 7, 11, 13 }, v));
+        test_cases.emplace_back(new test_glu_split(GGML_GLU_OP_SITU, GGML_TYPE_F32, { 8192, 17, 1, 1 }, v));
+    }
+
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
         for (int v : {0, 1}) {
             for (int op = 0; op < GGML_GLU_OP_COUNT; op++) {
-                if (op == GGML_GLU_OP_SWIGLU_OAI || op == GGML_GLU_OP_SWIGLU_CLAMP) {
+                if (op == GGML_GLU_OP_SWIGLU_OAI || op == GGML_GLU_OP_SWIGLU_CLAMP || op == GGML_GLU_OP_SITU) {
                     continue;
                 }
 
@@ -10918,7 +10929,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_l2_norm     (GGML_TYPE_F32, {4, 1, 65536, 1}, 1e-12f, false, false));
     test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {4, 1, 65536, 1}, 1e-6f, false, false));
 
-    for (uint32_t n : {1, 127, 129, 511, 513, 2816, 4096, 16385}) {
+    for (uint32_t n : {1, 127, 128, 129, 511, 513, 2816, 4096, 16385}) {
         test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, {n, 3, 2, 1}));
         test_cases.emplace_back(new test_rms_norm_mul_rope({n, 3, 2, 1}, 1e-6f, false, false, true, GGML_ROPE_TYPE_NORMAL, true, false));
         test_cases.emplace_back(new test_rms_norm_mul_add(GGML_TYPE_F32, {n, 3, 2, 1}, 1e-6f, false, false, false, false, true));

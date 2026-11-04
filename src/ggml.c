@@ -682,6 +682,20 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) ggml_fp16_to_fp32_row,
         .from_float_ref           = (ggml_from_float_t) ggml_fp32_to_fp16_row,
     },
+    [GGML_TYPE_F8_E4M3] = {
+        .type_name                = "f8_e4m3",
+        .blck_size                = 1,
+        .type_size                = sizeof(uint8_t),
+        .is_quantized             = false,
+        .to_float                 = (ggml_to_float_t) dequantize_row_f8_e4m3,
+    },
+    [GGML_TYPE_F8_E5M2] = {
+        .type_name                = "f8_e5m2",
+        .blck_size                = 1,
+        .type_size                = sizeof(uint8_t),
+        .is_quantized             = false,
+        .to_float                 = (ggml_to_float_t) dequantize_row_f8_e5m2,
+    },
     [GGML_TYPE_Q1_0] = {
         .type_name                = "q1_0",
         .blck_size                = QK1_0,
@@ -1108,6 +1122,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
 };
 
 static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
@@ -1224,6 +1239,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
 };
 
 static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
@@ -1265,9 +1281,10 @@ static const char * GGML_GLU_OP_NAME[GGML_GLU_OP_COUNT] = {
     "GEGLU_ERF",
     "GEGLU_QUICK",
     "SWIGLU_CLAMP",
+    "SITU",
 };
 
-static_assert(GGML_GLU_OP_COUNT == 7, "GGML_GLU_OP_COUNT != 7");
+static_assert(GGML_GLU_OP_COUNT == 8, "GGML_GLU_OP_COUNT != 8");
 
 static_assert(sizeof(struct ggml_object)%GGML_MEM_ALIGN == 0, "ggml_object size must be a multiple of GGML_MEM_ALIGN");
 static_assert(sizeof(struct ggml_tensor)%GGML_MEM_ALIGN == 0, "ggml_tensor size must be a multiple of GGML_MEM_ALIGN");
@@ -2930,6 +2947,10 @@ static struct ggml_tensor * ggml_glu_impl(
         enum ggml_glu_op      op,
         bool                  swapped) {
     GGML_ASSERT(ggml_is_contiguous_1(a));
+    if (op == GGML_GLU_OP_SITU) {
+        GGML_ASSERT(a->type == GGML_TYPE_F32);
+        GGML_ASSERT(b != NULL || a->ne[0] % 2 == 0);
+    }
 
     if (b) {
         GGML_ASSERT(ggml_is_contiguous_1(b));
