@@ -314,12 +314,58 @@ static int cpy_1d_contig(struct htp_ops_context * octx, const struct htp_copy_ke
     return HTP_STATUS_OK;
 }
 
+// A permuted attention value is dense along dim 0 but successive rows are far
+// apart. A single DMA queue serializes these short transfers. Divide complete
+// rows across HVX workers, preserving the outer strides of both views.
+static void cpy_strided_rows_worker(unsigned int nth, unsigned int ith, void * data) {
+    const struct htp_copy_context * ct = data;
+    const struct htp_tensor * src = ct->octx->src[0];
+    const struct htp_tensor * dst = ct->octx->dst;
+    const uint32_t start = ith * ct->src0_nrows_per_thread;
+    const uint32_t end = MIN(start + ct->src0_nrows_per_thread, ct->nrows);
+    const uint32_t bytes = src->ne[0] * ct->kparams->src0_type_size;
+    const uint32_t full_bytes = bytes / VLEN * VLEN;
+    (void) nth;
+
+    for (uint32_t row = start; row < end;) {
+        const uint32_t plane = row / src->ne[1];
+        const uint32_t i1 = row % src->ne[1];
+        const uint32_t i2 = plane % src->ne[2];
+        const uint32_t i3 = plane / src->ne[2];
+        const uint8_t * in = (const uint8_t *) (uintptr_t) src->data + i1*src->nb[1] + i2*src->nb[2] + i3*src->nb[3];
+        uint8_t * out = (uint8_t *) (uintptr_t) dst->data + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3];
+        const uint32_t count = MIN(end - row, src->ne[1] - i1);
+        for (uint32_t r = 0; r < count; ++r) {
+            hvx_copy_uu(out, in, full_bytes, 1);
+            if (bytes != full_bytes) {
+                memcpy(out + full_bytes, in + full_bytes, bytes - full_bytes);
+            }
+            in += src->nb[1];
+            out += dst->nb[1];
+        }
+        row += count;
+    }
+}
+
 static int cpy_sameshape_sametype(struct htp_ops_context * octx, const struct htp_copy_kernel_params * kparams) {
     const struct htp_tensor * src0 = octx->src[0];
     const struct htp_tensor * dst  = octx->dst;
 
     uint32_t row_start = 0;
     uint32_t nrows     = kparams->total_rows;
+
+    const uint32_t row_bytes = src0->ne[0] * kparams->src0_type_size;
+    if (octx->ctx->mdev.count <= 1 && nrows > 1 && src0->nb[1] != row_bytes &&
+        src0->data <= UINTPTR_MAX && dst->data <= UINTPTR_MAX) {
+        struct htp_copy_context ct = {
+            .octx = octx,
+            .kparams = kparams,
+            .nrows = nrows,
+            .src0_nrows_per_thread = fastdiv(nrows + octx->n_threads - 1, &octx->n_threads_div),
+        };
+        work_queue_run(octx->ctx->work_queue, cpy_strided_rows_worker, &ct, octx->n_threads);
+        return HTP_STATUS_OK;
+    }
 
     if (octx->ctx->mdev.count > 1) {
         const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(
