@@ -98,11 +98,19 @@ static void cpy_thread_##NAME##_reshape(unsigned int nth, unsigned int ith, void
     dma_addr_t src0_addr = src0->data + i00*nb00 + i01*nb01 + i02*nb02 + i03*nb03;                    \
                                                                                                       \
     const bool rows_contig = (nb00 == ELEM_SIZE) && (nb0 == ELEM_SIZE);                               \
+    const bool direct_strided = !rows_contig && octx->ctx->mdev.count <= 1 &&                        \
+                                !htp_tensor_is_extended(src0) && !htp_tensor_is_extended(dst);       \
                                                                                                       \
     while (e < th_end) {                                                                              \
         const uint32_t run = MIN(MIN(ne00 - i00, ne0 - i10), th_end - e);                             \
         if (rows_contig) {                                                                            \
             dma_cpy_sametype_reshape_contig(dma_q, dst_addr, src0_addr, run * ELEM_SIZE);             \
+        } else if (direct_strided) {                                                                  \
+            /* Narrow transposes otherwise submit a DMA descriptor for every few elements. */       \
+            for (uint32_t j = 0; j < run; ++j) {                                                     \
+                memcpy((void *) (uintptr_t) (dst_addr + j * nb0),                                   \
+                       (const void *) (uintptr_t) (src0_addr + j * nb00), ELEM_SIZE);                \
+            }                                                                                       \
         } else {                                                                                      \
             dma_cpy_push_2d_chunked(dma_q, dst_addr, src0_addr, nb0, nb00, ELEM_SIZE, run);           \
         }                                                                                             \
