@@ -450,12 +450,63 @@ static int cpy_sameshape_convert(struct htp_ops_context * octx, const struct htp
     return HTP_STATUS_OK;
 }
 
+// Interleave two contiguous channel halves without a DMA submission per pair.
+// Partition whole planes so workers never share a partially written vector.
+static void cpy_interleave_worker(unsigned int nth, unsigned int ith, void * data) {
+    const struct htp_copy_context * ct = data;
+    const struct htp_tensor * src = ct->octx->src[0];
+    const struct htp_tensor * dst = ct->octx->dst;
+    const uint32_t size = ct->kparams->src0_type_size;
+    const uint32_t bytes = src->ne[1] * size;
+    const uint32_t full_bytes = bytes / VLEN * VLEN;
+    const uint32_t start = ith * ct->src0_nrows_per_thread;
+    const uint32_t end = MIN(start + ct->src0_nrows_per_thread, ct->nrows);
+    (void) nth;
+
+    for (uint32_t row = start; row < end; ++row) {
+        const uint32_t i2 = row % src->ne[2];
+        const uint32_t i3 = row / src->ne[2];
+        const uint8_t * lo = (const uint8_t *) (uintptr_t) src->data + i2*src->nb[2] + i3*src->nb[3];
+        const uint8_t * hi = lo + src->nb[0];
+        uint8_t * out = (uint8_t *) (uintptr_t) dst->data + i2*dst->nb[2] + i3*dst->nb[3];
+        uint32_t x = 0;
+        for (; x < full_bytes; x += VLEN) {
+            const HVX_Vector a = hvx_vmemu(lo + x);
+            const HVX_Vector b = hvx_vmemu(hi + x);
+            const HVX_VectorPair pair = Q6_W_vshuff_VVR(b, a, -(int) size);
+            hvx_vmemu(out + 2*x) = Q6_V_lo_W(pair);
+            hvx_vmemu(out + 2*x + VLEN) = Q6_V_hi_W(pair);
+        }
+        for (; x < bytes; x += size) {
+            memcpy(out + 2*x, lo + x, size);
+            memcpy(out + 2*x + size, hi + x, size);
+        }
+    }
+}
+
 static int cpy_reshape(struct htp_ops_context * octx, const struct htp_copy_kernel_params * kparams) {
     const struct htp_tensor * src0 = octx->src[0];
     const struct htp_tensor * dst  = octx->dst;
 
     if (!htp_ops_context_set_n_threads(octx, kparams->n_threads)) {
         return HTP_STATUS_INVAL_PARAMS;
+    }
+
+    const uint32_t size = kparams->src0_type_size;
+    if (octx->ctx->mdev.count <= 1 && !htp_tensor_is_extended(src0) && !htp_tensor_is_extended(dst) &&
+        (size == 2 || size == 4) && src0->ne[0] == 2 && dst->ne[0] == 2 &&
+        src0->ne[1] == dst->ne[1] && src0->ne[2] == dst->ne[2] && src0->ne[3] == dst->ne[3] &&
+        src0->nb[1] == size && src0->nb[0] >= src0->ne[1] * size &&
+        dst->nb[0] == size && dst->nb[1] == 2 * size) {
+        const uint32_t planes = src0->ne[2] * src0->ne[3];
+        struct htp_copy_context ct = {
+            .octx = octx,
+            .kparams = kparams,
+            .nrows = planes,
+            .src0_nrows_per_thread = fastdiv(planes + octx->n_threads - 1, &octx->n_threads_div),
+        };
+        work_queue_run(octx->ctx->work_queue, cpy_interleave_worker, &ct, octx->n_threads);
+        return HTP_STATUS_OK;
     }
 
     uint32_t elem_start = 0;
