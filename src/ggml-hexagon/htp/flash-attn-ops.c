@@ -1313,7 +1313,7 @@ static inline void fa_softmax_impl(
                 }
             } else {
                 size_t c = 0;
-                for (; c + 64 < kv_rows; c += 128) {
+                for (; c + 128 <= kv_rows; c += 128) {
                     size_t             ci0       = c / 64;
                     size_t             ci1       = ci0 + 1;
                     const __fp16 *     in_dtile0 = s_ld_base + ci0 * HMX_FP16_TILE_N_ELMS * 2;
@@ -1420,7 +1420,8 @@ static inline void fa_softmax_impl(
                 }
             } else {
                 size_t c = 0;
-                for (; c + 64 < kv_rows; c += 128) {
+                // A partial second vector must reach the tail-masking loop.
+                for (; c + 128 <= kv_rows; c += 128) {
                     size_t ci0 = c / 64;
                     size_t ci1 = ci0 + 1;
                     v_s_rowmax0 = Q6_Vhf_vmax_VhfVhf(v_s_rowmax0, my_row_buf0[ci0]);
@@ -1486,7 +1487,7 @@ static inline void fa_softmax_impl(
             HVX_Vector       v_p_rowsum1 = v_zero;
 
             size_t c = 0;
-            for (; c + 64 < kv_rows; c += 128) {
+            for (; c + 128 <= kv_rows; c += 128) {
                 size_t     ci0          = c / 64;
                 size_t     ci1          = ci0 + 1;
 
@@ -2054,8 +2055,10 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
     factx.n_kv_blocks    = kparams->n_kv_blocks;
     factx.is_q_fp32      = (q->type == HTP_TYPE_F32);
     factx.is_dst_fp32    = (dst->type == HTP_TYPE_F32);
-    factx.pipeline       = (kparams->u.hmx.pipeline != 0);
     factx.mask_broadcast = (kparams->u.hmx.mask_broadcast != 0);
+    // Per-head masks share one staging buffer; prefetching the next block
+    // would overwrite the current mask before softmax consumes it.
+    factx.pipeline       = (kparams->u.hmx.pipeline != 0) && (!mask || factx.mask_broadcast);
     if (mask) {
         factx.src3_div2  = kparams->src3_div2;
         factx.src3_div3  = kparams->src3_div3;
