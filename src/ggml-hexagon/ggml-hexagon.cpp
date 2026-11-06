@@ -2394,6 +2394,35 @@ static inline bool op_is_compute(ggml_tensor *node)
     return !ggml_op_is_empty(node->op) && !ggml_is_empty(node) && (node->flags & GGML_TENSOR_FLAG_COMPUTE);
 }
 
+// The conv kernel takes one image (ne[3] == 1). A batch -- TAEHV keeps a video's frames
+// there -- becomes one node per image, each reading and writing its own slab of the
+// same buffers through dummy tensors: no copies, no CPU fallback. Without it every conv
+// of a TAEHV decode ran on the CPU (30 of 31 s at 512x320x17, and a phone-rebooting
+// RAM spike at 832x480x33).
+static bool ggml_hexagon_conv2d_split_batch(const htp_opnode & node, std::vector<htp_opnode> & out) {
+    const ggml_tensor * dst = node.node;
+    const ggml_tensor * src = dst->src[1];
+    if (dst->op == GGML_OP_CONV_3D_CAUSAL || src == nullptr || src->ne[3] <= 1 ||
+        dst->ne[3] != src->ne[3] || dst->src[3] != nullptr ||
+        node.inputs.size() < 2 || node.inputs[1] != src || node.outputs.size() != 1) {
+        return false;
+    }
+    for (int64_t i = 0; i < src->ne[3]; i++) {
+        htp_opnode part = node;
+        ggml_tensor s = *src;
+        s.ne[3] = 1;
+        s.data  = (uint8_t *) src->data + i * src->nb[3];
+        ggml_tensor d = *dst;
+        d.ne[3] = 1;
+        d.data  = (uint8_t *) dst->data + i * dst->nb[3];
+        part.inputs[1]  = part.add_dummy(s);
+        part.outputs[0] = part.add_dummy(d);
+        out.push_back(std::move(part));
+    }
+    return true;
+}
+
+
 static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
     auto sess = static_cast<ggml_hexagon_session *>(backend->context);
 
@@ -2440,6 +2469,9 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
             }
 
             GGML_ASSERT(htp_kparams_solve(sess, node));
+            if (node.opcode == HTP_OP_CONV_2D && ggml_hexagon_conv2d_split_batch(node, computed_nodes)) {
+                continue;
+            }
             if (node.opcode == HTP_OP_CPY && node.kparams<htp_copy_kernel_params>()->total_elems == 0) {
                 continue;
             }

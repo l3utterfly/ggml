@@ -143,7 +143,7 @@ static bool supports_conv2d(const struct ggml_hexagon_session * sess, const stru
         return false;
     }
     if (!ggml_is_contiguous(weight) || !ggml_is_contiguous(src) || !ggml_is_contiguous(op) ||
-        src->ne[3] != 1 || op->ne[3] != 1) {
+        src->ne[3] != op->ne[3] || (residual && src->ne[3] != 1)) {
         return false;
     }
     if ((op->op == GGML_OP_CONV_2D_BIAS && !bias) ||
