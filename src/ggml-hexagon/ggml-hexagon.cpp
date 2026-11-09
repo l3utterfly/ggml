@@ -89,6 +89,9 @@ size_t opt_vtcm_size  = 0; // VTCM size override in bytes; 0 = auto-detect
 size_t opt_vmem       = HTP_OP_MAX_VMEM_DEFAULT;  // max available va space for buffer mappings
 int    opt_etm        = 0;
 int    opt_verbose    = 0;
+static int opt_trace = 0;
+static std::atomic<size_t> trace_rpcmem_bytes{0};
+#define HEX_TRACE(fmt, ...) do { if (opt_trace) { GGML_LOG_INFO("HTP_TRACE us=%lld " fmt, (long long) ggml_time_us(), __VA_ARGS__); } } while (0)
 int    opt_profile    = 0; // profiling mode (0-disabled, 1-basic, 2-pmu)
 bool   opt_hostbuf    = false;
 bool   opt_dma64      = false;
@@ -440,6 +443,7 @@ struct ggml_hexagon_rpcmem_block {
     std::unordered_set<ggml_hexagon_session *> mapped_clones;
 
     ggml_hexagon_rpcmem_block(size_t size) {
+        HEX_TRACE("rpcmem-alloc.begin bytes=%zu live_bytes=%zu\n", size, trace_rpcmem_bytes.load());
         base = (uint8_t *) rpcmem_alloc2(RPCMEM_HEAP_ID_SYSTEM, RPCMEM_DEFAULT_FLAGS, size);
         if (!base) {
             throw std::runtime_error("ggml-hex: rpcmem_alloc failed");
@@ -450,11 +454,16 @@ struct ggml_hexagon_rpcmem_block {
             throw std::runtime_error("ggml-hex: rpcmem_to_fd failed");
         }
         this->size = size;
+        const size_t live = trace_rpcmem_bytes.fetch_add(size) + size;
+        HEX_TRACE("rpcmem-alloc.end fd=%d bytes=%zu live_bytes=%zu\n", fd, size, live);
     }
 
     ~ggml_hexagon_rpcmem_block() {
         if (base) {
+            HEX_TRACE("rpcmem-free.begin fd=%d bytes=%zu\n", fd, size);
             rpcmem_free(base);
+            const size_t live = trace_rpcmem_bytes.fetch_sub(size) - size;
+            HEX_TRACE("rpcmem-free.end fd=%d live_bytes=%zu\n", fd, live);
         }
     }
 };
@@ -481,7 +490,9 @@ struct ggml_hexagon_shared_buffer {
         this->extended = extended;
         fastrpc_map_flags flags = this->pinned ? FASTRPC_MAP_FD : (extended ? FASTRPC_MAP_FD_DELAYED_EXTENDED : FASTRPC_MAP_FD_DELAYED);
 
+        HEX_TRACE("rpcmem-map.begin session=%s fd=%d bytes=%zu\n", c_name(), fd(), size());
         int err = fastrpc_mmap(sess->domain_id, fd(), (void *) base(), 0, size(), flags);
+        HEX_TRACE("rpcmem-map.end session=%s fd=%d status=%d\n", c_name(), fd(), err);
         if (err != 0) {
             GGML_LOG_ERROR("ggml-hex: %s buffer mapping failed : domain_id %d size %zu fd %d error 0x%08x\n", sess->c_name(),
                     sess->domain_id, size(), fd(), (unsigned) err);
@@ -1778,6 +1789,8 @@ void ggml_hexagon_session::flush_pending(bool all) {
 
         GGML_ASSERT(rsp.seq == this->batch_rsp_seq + 1);
         this->batch_rsp_seq = rsp.seq;
+        HEX_TRACE("batch-complete session=%s seq=%llu ops=%u status=%s\n", c_name(),
+                  (unsigned long long) rsp.seq, rsp.n_ops, status_to_str(rsp.status));
 
         if (!all) break;
     }
@@ -1803,6 +1816,8 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
     dspqueue_buffer dbuf{};
 
     const uint64_t seq = ++this->batch_req_seq;
+    HEX_TRACE("batch-submit.begin session=%s seq=%llu ops=%u buffers=%u mapped_bytes=%zu\n",
+              c_name(), (unsigned long long) seq, op_batch->n_ops, op_batch->n_bufs, op_batch->b_vmem);
 
     op_batch->update_mdev_group(this->mdev.idx);
 
@@ -1838,6 +1853,7 @@ void ggml_hexagon_session::flush_batch(size_t min_ops) {
         GGML_ABORT("ggml-hex: %s dspqueue_write failed: 0x%08x\n", this->c_name(), (unsigned) err);
     }
 
+    HEX_TRACE("batch-submit.end session=%s seq=%llu\n", c_name(), (unsigned long long) seq);
     op_batch->reset();
 }
 
@@ -2425,6 +2441,8 @@ static bool ggml_hexagon_conv2d_split_batch(const htp_opnode & node, std::vector
 
 static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
     auto sess = static_cast<ggml_hexagon_session *>(backend->context);
+    HEX_TRACE("graph-prepare.begin session=%s nodes=%d uid=%llu\n", sess->c_name(), graph->n_nodes,
+              (unsigned long long) graph->uid);
 
     if (sess->last_error > HTP_STATUS_OK) {
         return GGML_STATUS_FAILED;
@@ -2455,20 +2473,26 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
             }
 
             htp_opnode node(opcode, n);
+            HEX_TRACE("kernel-prepare.begin index=%d op=%s name=%s src0=%s type=%s\n", i, ggml_op_desc(n),
+                      n->name, n->src[0] ? n->src[0]->name : "-",
+                      n->src[0] ? ggml_type_name(n->src[0]->type) : "-");
             if (node.opcode == HTP_OP_MUL_MAT || node.opcode == HTP_OP_MUL_MAT_ID ||
                 node.opcode == HTP_OP_MUL_MAT_SEGMENTED || node.opcode == HTP_OP_GET_ROWS) {
                 ggml_tensor * src0 = node.node->src[0];
                 if (htp_needs_repack(src0)) {
+                    HEX_TRACE("repack.begin tensor=%s bytes=%zu\n", src0->name, ggml_nbytes(src0));
                     HEX_VERBOSE("ggml-hex: %s rt-repack %s|size %zu\n", sess->c_name(), htp_format_tensor(src0, HTP_OPFMT_TENSOR).c_str(), ggml_nbytes(src0));
                     std::vector<uint8_t> raw(ggml_nbytes(src0));
                     memcpy(raw.data(), src0->data, raw.size());
                     htp_repack_tensor_tiled(src0, raw.data(), raw.size());
                     auto * extra = (htp_tensor_extra *) src0->extra;
                     extra->flags |= HTP_TENSOR_TILED;
+                    HEX_TRACE("repack.end tensor=%s\n", src0->name);
                 }
             }
 
             GGML_ASSERT(htp_kparams_solve(sess, node));
+            HEX_TRACE("kernel-prepare.end index=%d op=%s\n", i, ggml_op_desc(n));
             if (node.opcode == HTP_OP_CONV_2D && ggml_hexagon_conv2d_split_batch(node, computed_nodes)) {
                 continue;
             }
@@ -2488,6 +2512,7 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
         }
     }
 
+    HEX_TRACE("graph-enqueue.begin session=%s kernels=%zu cache_hit=%d\n", sess->c_name(), nodes_ptr->size(), cache_hit);
     for (const auto & node : *nodes_ptr) {
         sess->enqueue_op(node);
     }
@@ -2496,6 +2521,7 @@ static ggml_status ggml_backend_hexagon_graph_compute(ggml_backend_t backend, gg
         return GGML_STATUS_FAILED;
     }
 
+    HEX_TRACE("graph-enqueue.end session=%s\n", sess->c_name());
     return GGML_STATUS_SUCCESS;
 }
 
@@ -3515,6 +3541,7 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
 
     opt_opfilter  = str_opfilter ? new std::regex(str_opfilter, RE_ICASE) : NULL;
     opt_verbose   = str_verbose  ? atoi(str_verbose)                      : 0;
+    opt_trace     = getenv("GGML_HEXAGON_TRACE") ? atoi(getenv("GGML_HEXAGON_TRACE")) : 0;
     opt_opbatch   = str_opbatch  ? strtoul(str_opbatch, NULL, 0)          : opt_opbatch;
     opt_opqueue   = str_opqueue  ? strtoul(str_opqueue, NULL, 0)          : opt_opqueue;
     opt_optrace   = str_optrace  ? strtoul(str_optrace, NULL, 0)          : (opt_opbatch * HTP_TRACE_MAX_EVENTS + 131072);
