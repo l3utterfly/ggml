@@ -753,15 +753,29 @@ static void ggml_backend_hexagon_buffer_get_tensor(ggml_backend_buffer_t buffer,
     htp_unpack_tensor_tiled(data, tensor, offset, size);
 }
 
+static bool ggml_backend_buffer_is_hexagon(const struct ggml_backend_buffer * b);
+
+// Both buffers are host-mapped shared memory, so a plain tensor needs one memcpy
+// instead of the generic path's copy through a temporary host buffer. The graph
+// cut output cache copies every segment's output this way (Nightmare Mobile dit/051).
+// Weight buffers and packed tensors keep get/set_tensor, which own their layouts.
 static bool ggml_backend_hexagon_buffer_cpy_tensor(ggml_backend_buffer_t      buffer,
                                                    const struct ggml_tensor * src,
                                                    struct ggml_tensor *       dst) {
-    // we might optimize this later, for now take the slow path (ie get/set_tensor)
-    return false;
-
-    GGML_UNUSED(buffer);
-    GGML_UNUSED(src);
-    GGML_UNUSED(dst);
+    if (src->buffer == nullptr || !ggml_backend_buffer_is_hexagon(src->buffer) ||
+        ggml_backend_buffer_get_usage(src->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+        ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS ||
+        src->data == nullptr || dst->data == nullptr || ggml_nbytes(src) != ggml_nbytes(dst)) {
+        return false;
+    }
+    const uint32_t packed    = HTP_TENSOR_WEIGHT | HTP_TENSOR_TILED | HTP_TENSOR_CONV2D;
+    const auto *   src_extra = (const htp_tensor_extra *) src->extra;
+    const auto *   dst_extra = (const htp_tensor_extra *) dst->extra;
+    if ((src_extra && (src_extra->flags & packed)) || (dst_extra && (dst_extra->flags & packed))) {
+        return false;
+    }
+    memcpy(dst->data, src->data, ggml_nbytes(src));
+    return true;
 }
 
 static void ggml_backend_hexagon_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
