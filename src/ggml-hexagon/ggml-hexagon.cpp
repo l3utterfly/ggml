@@ -128,7 +128,7 @@ static const char * htp_power_mode_to_str(int mode) {
     return "unknown";
 }
 
-size_t opt_mbuf_dyn    = 512ul * 1024 * 1024;      // max dynamic (compute) buffer size
+size_t opt_mbuf_dyn    = 1ul * 1024 * 1024 * 1024; // max dynamic (compute) buffer size
 size_t opt_mbuf_static = 1ul * 1024 * 1024 * 1024; // max static (weight/KV) buffer size
 size_t opt_mbuf_total  = 0;                        // total buffer space limit (0 = unconstrained)
 
