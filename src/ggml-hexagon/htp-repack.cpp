@@ -321,34 +321,41 @@ static void repack_neon_f16_tile(uint16_t * tile_dst, const SrcT * src_slice, in
 
 // --- Generic 32x32 tile grid walkers for block-32 and float types ---
 
+// Segmented DiTs re-upload streamed weights every step, one tensor at a time under the
+// loader's set_tensor lock, so the repack itself must use the cores. Jobs write disjoint
+// tiles; small tensors stay on the calling thread (one worker per MiB at most).
 template <typename Fn>
-static void repack_parallel_for_ct(size_t slice_bytes, int n_col_tiles, Fn && fn) {
+static void repack_parallel_range(int64_t n_jobs, size_t bytes, Fn && fn) {
+    constexpr int max_threads = 8;
     int n_threads = 1;
-    if (slice_bytes > 128 * 1024) {
-        for (int nt : { 4, 3, 2 }) {
-            if (n_col_tiles % nt == 0) {
-                n_threads = nt;
-                break;
-            }
-        }
+    if (bytes > 128 * 1024) {
+        n_threads = (int) std::min<int64_t>({ (int64_t) std::max(1u, std::thread::hardware_concurrency()),
+                                              (int64_t) max_threads, n_jobs,
+                                              (int64_t) std::max<size_t>(1, bytes >> 20) });
     }
 
     if (n_threads <= 1) {
-        fn(0, n_col_tiles);
+        fn((int64_t) 0, n_jobs);
         return;
     }
 
-    const int chunk = n_col_tiles / n_threads;
-    std::thread workers[3];
+    std::thread workers[max_threads - 1];
     for (int i = 0; i < n_threads - 1; ++i) {
-        workers[i] = std::thread([&fn, i, chunk]() {
-            fn(i * chunk, (i + 1) * chunk);
+        workers[i] = std::thread([&fn, i, n_jobs, n_threads]() {
+            fn(n_jobs * i / n_threads, n_jobs * (i + 1) / n_threads);
         });
     }
-    fn((n_threads - 1) * chunk, n_col_tiles);
+    fn(n_jobs * (n_threads - 1) / n_threads, n_jobs);
     for (int i = 0; i < n_threads - 1; ++i) {
         workers[i].join();
     }
+}
+
+template <typename Fn>
+static void repack_parallel_for_ct(size_t slice_bytes, int n_col_tiles, Fn && fn) {
+    repack_parallel_range(n_col_tiles, slice_bytes, [&fn](int64_t ct0, int64_t ct1) {
+        fn((int) ct0, (int) ct1);
+    });
 }
 
 template <typename SrcElemT, int ELEMS_PER_KTILE, typename PackTileFn>
@@ -1533,6 +1540,15 @@ static inline size_t f8_e4m3_tile_offset(int row, int col) {
     return (size_t) tile_row * 32 + tile_col;
 }
 
+// Four consecutive k-values of one row as they sit in a tile word: lanes 0, 2, 1, 3
+// (f8_e4m3_tile_offset), with negative zero (0x80) stored as 0.
+static inline uint32_t f8_e4m3_tile_word(uint32_t w) {
+    w = (w & 0xff0000ffu) | ((w & 0x0000ff00u) << 8) | ((w & 0x00ff0000u) >> 8);
+    const uint32_t y = w ^ 0x80808080u;
+    const uint32_t zero_bytes = ~(((y & 0x7f7f7f7fu) + 0x7f7f7f7fu) | y | 0x7f7f7f7fu);
+    return w & ~((zero_bytes >> 7) * 0xffu);
+}
+
 static void repack_f8_e4m3_tiled(ggml_tensor * t, const void * data, size_t size) {
     GGML_ASSERT(size == ggml_nbytes(t));
 
@@ -1546,27 +1562,42 @@ static void repack_f8_e4m3_tiled(ggml_tensor * t, const void * data, size_t size
     const int n_k_tiles = ne0_padded / 32;
     const int n_col_tiles = ne1_padded / 32;
     const size_t matrix_size = (size_t) n_col_tiles * n_k_tiles * HTP_TENSOR_TILE_SIZE_F8_E4M3;
+    const bool aligned = ne0 % 32 == 0 && ne1 % 32 == 0;
 
-    for (int64_t i3 = 0; i3 < ne3; ++i3) {
-        for (int64_t i2 = 0; i2 < ne2; ++i2) {
-            const uint8_t * matrix_src = src + (i3 * ne2 + i2) * ne1 * ne0;
-            uint8_t * matrix_dst = (uint8_t *) t->data + (i3 * ne2 + i2) * matrix_size;
+    repack_parallel_range(ne2 * ne3 * n_col_tiles, size, [&](int64_t job0, int64_t job1) {
+        for (int64_t job = job0; job < job1; ++job) {
+            const int64_t matrix = job / n_col_tiles;
+            const int ct = (int) (job % n_col_tiles);
+            const uint8_t * matrix_src = src + matrix * ne1 * ne0;
+            uint8_t * col_dst = (uint8_t *) t->data + matrix * matrix_size +
+                                (size_t) ct * n_k_tiles * HTP_TENSOR_TILE_SIZE_F8_E4M3;
 
-            for (int ct = 0; ct < n_col_tiles; ++ct) {
-                for (int kt = 0; kt < n_k_tiles; ++kt) {
-                    uint8_t * tile = matrix_dst + ((size_t) ct * n_k_tiles + kt) * HTP_TENSOR_TILE_SIZE_F8_E4M3;
-                    for (int row = 0; row < 32; ++row) {
-                        const int64_t j = (int64_t) ct * 32 + row;
-                        for (int col = 0; col < 32; ++col) {
-                            const int64_t i = (int64_t) kt * 32 + col;
-                            const uint8_t value = i < ne0 && j < ne1 ? matrix_src[j * ne0 + i] : 0;
-                            tile[f8_e4m3_tile_offset(row, col)] = value == 0x80 ? 0 : value;
+            for (int kt = 0; kt < n_k_tiles; ++kt) {
+                uint8_t * tile = col_dst + (size_t) kt * HTP_TENSOR_TILE_SIZE_F8_E4M3;
+                if (aligned) {
+                    uint32_t * words = (uint32_t *) tile;
+                    for (int tile_row = 0; tile_row < 32; ++tile_row) {
+                        const int64_t k = (int64_t) kt * 32 + (tile_row / 4) * 4;
+                        const int64_t row0 = (int64_t) ct * 32 + (tile_row % 4) * 8;
+                        for (int q = 0; q < 8; ++q) {
+                            uint32_t w;
+                            memcpy(&w, matrix_src + (row0 + q) * ne0 + k, sizeof(w));
+                            words[tile_row * 8 + q] = f8_e4m3_tile_word(w);
                         }
+                    }
+                    continue;
+                }
+                for (int row = 0; row < 32; ++row) {
+                    const int64_t j = (int64_t) ct * 32 + row;
+                    for (int col = 0; col < 32; ++col) {
+                        const int64_t i = (int64_t) kt * 32 + col;
+                        const uint8_t value = i < ne0 && j < ne1 ? matrix_src[j * ne0 + i] : 0;
+                        tile[f8_e4m3_tile_offset(row, col)] = value == 0x80 ? 0 : value;
                     }
                 }
             }
         }
-    }
+    });
 }
 
 static void repack_tiled_f8_e4m3(void * data, const ggml_tensor * t, size_t offset, size_t size) {
