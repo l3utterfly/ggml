@@ -3091,6 +3091,8 @@ static ggml_backend_buffer_type_t ggml_backend_hexagon_device_get_host_buffer_ty
 // IMPORTANT: supports_op runs before buffer allocation and before tensor data is populated.
 // Never check buffer usage, buffer properties, or repacking state (is_tiled) here.
 // Support must depend only on static tensor properties (shape, type, strides).
+// One exception: under DMA64 an input already allocated in a weight buffer is mapped above 4 GiB,
+// which some kernels cannot address (htp_tensor_maps_extended); an unallocated input passes.
 static bool ggml_backend_hexagon_device_supports_op(ggml_backend_dev_t dev, const struct ggml_tensor * op) {
     auto dev_ctx = static_cast<ggml_backend_hexagon_device_context *>(dev->context);
     auto sess    = dev_ctx->session();

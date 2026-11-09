@@ -77,6 +77,18 @@ static inline bool htp_needs_repack(const struct ggml_tensor * t) {
     return htp_can_rt_repack(t);
 }
 
+// With DMA64, weight buffers are mapped above 4 GiB on the DSP (see mmap_tensor). Kernels that
+// address a tensor directly instead of through DMA refuse those with HTP_STATUS_NO_SUPPORT, which
+// aborts the graph, so their solvers must leave such ops to another backend. A tensor without a
+// buffer yet (supports_op before allocation) is not treated as a weight.
+static inline bool htp_tensor_maps_extended(const struct ggml_tensor * t) {
+    if (!opt_dma64 || !t) {
+        return false;
+    }
+    ggml_backend_buffer_t buf = t->view_src && t->view_src->buffer ? t->view_src->buffer : t->buffer;
+    return buf && ggml_backend_buffer_get_usage(buf) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+}
+
 static inline bool htp_tensors_overlap(const struct ggml_tensor * a, const struct ggml_tensor * b) {
     const uintptr_t a0 = (uintptr_t) a->data;
     const uintptr_t b0 = (uintptr_t) b->data;

@@ -3145,6 +3145,9 @@ static bool htp_kparams_solve_pad(
 
     const bool use_dma = (src0->nb[0] == type_size) && (src0->ne[0] >= 512) &&
                          (htp_session_vtcm_size(sess) >= layout.total_bytes);
+    if (!use_dma && htp_tensor_maps_extended(src0)) {
+        return false;
+    }
 
     kparams->n_threads  = n_threads;
     kparams->total_rows = total_dst_rows;
@@ -3196,6 +3199,9 @@ static bool htp_kparams_solve_cumsum(
     htp_cumsum_vtcm_layout_build(&layout, (uint32_t) src0->nb[1], (uint32_t) dst->nb[1], n_threads);
 
     const bool use_dma = (htp_session_vtcm_size(sess) >= layout.total_bytes);
+    if (!use_dma && htp_tensor_maps_extended(src0)) {
+        return false;
+    }
 
     kparams->n_threads  = n_threads;
     kparams->total_rows = total_rows;
@@ -3350,6 +3356,9 @@ static bool htp_kparams_solve_diag(
     htp_diag_vtcm_layout_build(&layout, src_batch_size, dst_row_size, n_threads);
 
     const bool use_dma = (htp_session_vtcm_size(sess) >= layout.total_bytes);
+    if (!use_dma && htp_tensor_maps_extended(src0)) {
+        return false;
+    }
 
     kparams->n_threads         = n_threads;
     kparams->total_batches     = total_batches;
@@ -3526,12 +3535,46 @@ bool htp_kparams_solve(
     return htp_kparams_solve(sess, node.node, node.kernel_params);
 }
 
+// Inputs these kernels refuse when extended (htp_tensor_is_extended in htp/*-ops.c). PAD, CUMSUM
+// and DIAG only refuse on their non-DMA path, so their solvers check instead.
+static bool htp_op_reads_extended_input(htp_op_code opcode, const struct ggml_tensor * op) {
+    switch (opcode) {
+        case HTP_OP_REPEAT:
+        case HTP_OP_ROLL:
+        case HTP_OP_SUM_ROWS:
+        case HTP_OP_SUM:
+        case HTP_OP_ARGMAX:
+        case HTP_OP_ARGSORT:
+        case HTP_OP_TOP_K:
+            return htp_tensor_maps_extended(op->src[0]);
+        case HTP_OP_SOLVE_TRI:
+            return htp_tensor_maps_extended(op->src[0]) || htp_tensor_maps_extended(op->src[1]);
+        case HTP_OP_ROPE:
+        case HTP_OP_SET_ROWS:
+            return htp_tensor_maps_extended(op->src[1]);
+        case HTP_OP_MUL_MAT_ID:
+            return htp_tensor_maps_extended(op->src[1]) || htp_tensor_maps_extended(op->src[2]);
+        case HTP_OP_GATED_DELTA_NET:
+            for (int i = 0; i < GGML_MAX_SRC; i++) {
+                if (htp_tensor_maps_extended(op->src[i])) {
+                    return true;
+                }
+            }
+            return false;
+        default:
+            return false;
+    }
+}
+
 bool htp_kparams_solve(
     const struct ggml_hexagon_session * sess,
     const struct ggml_tensor * op,
     void * kparams
 ) {
     const htp_op_code opcode = htp_op_remap(op);
+    if (htp_op_reads_extended_input(opcode, op)) {
+        return false;
+    }
     if (htp_op_is_unary(opcode) || htp_op_is_glu(opcode)) {
         htp_opnode tmp(opcode, op);
         if (!htp_kparams_solve(sess, tmp)) {
