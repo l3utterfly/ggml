@@ -2814,7 +2814,7 @@ static int hmx_mm_2d_f32(struct htp_context *ctx,
 
     const uint32_t dma_dst_stride  = is_tiled ? aligned_tile_size : row_stride;
     const uint32_t dma_src_stride  = is_tiled ? tile_size : weight_stride;
-    const bool pad_weight = !is_tiled && weight_type == HTP_TYPE_F16 && k_valid < k;
+    const bool pad_weight = !is_tiled && (weight_type == HTP_TYPE_F16 || weight_type == HTP_TYPE_BF16) && k_valid < k;
     const uint32_t dma_width_bytes = is_tiled ? tile_size : pad_weight ? k_valid * sizeof(__fp16) : row_stride;
 
     size_t m_chunk_n_rows = m_chunk;
