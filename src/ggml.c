@@ -305,6 +305,9 @@ static void ggml_log_internal_v(enum ggml_log_level level, const char * format, 
 }
 
 void ggml_log_internal(enum ggml_log_level level, const char * format, ...) {
+#ifdef GGML_QUIET_LOGS
+    if (level != GGML_LOG_LEVEL_WARN && level != GGML_LOG_LEVEL_ERROR) return;
+#endif
     va_list args;
     va_start(args, format);
     ggml_log_internal_v(level, format, args);

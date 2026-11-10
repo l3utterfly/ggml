@@ -454,7 +454,7 @@ struct ggml_hexagon_rpcmem_block {
             throw std::runtime_error("ggml-hex: rpcmem_to_fd failed");
         }
         this->size = size;
-        const size_t live = trace_rpcmem_bytes.fetch_add(size) + size;
+        const size_t live = opt_trace ? trace_rpcmem_bytes.fetch_add(size) + size : 0;
         HEX_TRACE("rpcmem-alloc.end fd=%d bytes=%zu live_bytes=%zu\n", fd, size, live);
     }
 
@@ -462,7 +462,7 @@ struct ggml_hexagon_rpcmem_block {
         if (base) {
             HEX_TRACE("rpcmem-free.begin fd=%d bytes=%zu\n", fd, size);
             rpcmem_free(base);
-            const size_t live = trace_rpcmem_bytes.fetch_sub(size) - size;
+            const size_t live = opt_trace ? trace_rpcmem_bytes.fetch_sub(size) - size : 0;
             HEX_TRACE("rpcmem-free.end fd=%d live_bytes=%zu\n", fd, live);
         }
     }
@@ -3819,6 +3819,14 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
                 vec_to_str<uint32_t, 16>(opt_pmu_evt).c_str());
     }
 
+#ifdef GGML_QUIET_LOGS
+    opt_verbose = 0;
+    opt_trace = 0;
+    opt_profile = 0;
+    opt_etm = 0;
+    opt_optrace = 0;
+    opt_pmu_evt.clear();
+#endif
     reg->context = new ggml_hexagon_registry(reg);
 }
 

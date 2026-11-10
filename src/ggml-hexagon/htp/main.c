@@ -1340,8 +1340,8 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
     struct htp_op_desc*   ops = (struct htp_op_desc*)   m_ptr; m_ptr += o_size;
     struct htp_prof_desc* pds = (struct htp_prof_desc*) m_ptr;
 
-    struct profile_data batch_prof;
-    profile_start(HTP_PROF_BASIC, &batch_prof);
+    struct profile_data batch_prof = {0};
+    profile_start(ctx->profiler, &batch_prof);
 
     memset(ctx->trace, 0, sizeof(ctx->trace));
     if (ctx->profiler == HTP_PROF_TRACE) {
@@ -1412,7 +1412,7 @@ static void process_opbatch(struct htp_context * ctx, const struct htp_opbatch_r
 
     htp_mdev_group_barrier(octx);
 
-    profile_stop(HTP_PROF_BASIC, &batch_prof);
+    profile_stop(ctx->profiler, &batch_prof);
 
     struct htp_opbatch_rsp rsp;
     memset(&rsp, 0, sizeof(rsp));
