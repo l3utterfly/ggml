@@ -42,6 +42,8 @@ struct htp_conv2d_kernel_params {
     uint32_t ic_padded;
     uint32_t oc;
     uint32_t residual_factor_t;
+    uint32_t off_weight_pack;
+    uint32_t weight_pack_row_stride;
 };
 
 #if defined(__cplusplus)
@@ -66,7 +68,8 @@ static inline uint32_t htp_conv2d_layout_build(
         uint32_t tile_w,
         uint32_t tile_h,
         uint32_t n_threads,
-        uint32_t input_element_size) {
+        uint32_t input_element_size,
+        uint32_t weight_pack_threads) {
     const uint32_t k = kh * kw * ic;
     const uint32_t halo_w = tile_w + kw - 1u;
     const uint32_t halo_h = tile_h + kh - 1u;
@@ -132,6 +135,11 @@ static inline uint32_t htp_conv2d_layout_build(
 
     p->off_scales = off;
     off = htp_conv2d_align_up(off + 256u, HTP_CONV2D_TILE_BYTES);
+
+    p->off_weight_pack = off;
+    p->weight_pack_row_stride = weight_pack_threads ?
+        (uint32_t) htp_conv2d_align_up((uint64_t) kh * kw * 32u * sizeof(uint16_t), 128u) : 0;
+    off += (uint64_t) weight_pack_threads * 2u * p->weight_pack_row_stride;
 
     p->vtcm_size = off < UINT32_MAX ? (uint32_t) off : UINT32_MAX;
     return p->vtcm_size;

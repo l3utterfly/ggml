@@ -2,6 +2,7 @@
 #include <HAP_farf.h>
 #include <hexagon_protos.h>
 #include <hexagon_types.h>
+#include <stdlib.h>
 #include <string.h>
 
 #define GGML_COMMON_DECL_C
@@ -955,6 +956,8 @@ struct conv_weight_pack_state {
     dma_addr_t src_addr;
     bool extended;
     __fp16 * dst;
+    uint8_t * scratch;
+    uint32_t scratch_row_stride;
     uint32_t kw;
     uint32_t kh;
     uint32_t kd;
@@ -985,15 +988,22 @@ static void conv_pack_weight_slice_worker(unsigned int nth, unsigned int ith, vo
         // 32-channel tile of the current temporal slice for each output pair.
         if (st->extended) {
             dma_queue * q = st->ctx->dma[ith];
-            __fp16 rows[2][9 * 32] __attribute__((aligned(128)));
+            // DMA bypasses the cache; its destination must not be a cached stack array.
+            __fp16 * rows[2] = {
+                (__fp16 *) (st->scratch + (size_t) (2u * ith) * st->scratch_row_stride),
+                (__fp16 *) (st->scratch + (size_t) (2u * ith + 1u) * st->scratch_row_stride),
+            };
             const uint32_t row_bytes = area * sizeof(__fp16);
             const uint32_t count = local_oc1 < st->oc_count ? 2u : 1u;
             for (uint32_t c0 = 0; c0 < st->ic; c0 += 32) {
                 const uint32_t nc = hex_smin(st->ic - c0, 32);
                 for (uint32_t j = 0; j < count; ++j) {
                     const size_t index = area * (st->kd - 1u + (size_t) st->kd * (c0 + (size_t) st->ic * (oc0 + j)));
-                    dma_queue_push(q, dma_make_data(rows[j], st->src_addr + index * sizeof(__fp16)),
-                                   row_bytes, st->kd * row_bytes, row_bytes, nc);
+                    if (!dma_queue_push(q, dma_make_data(rows[j], st->src_addr + index * sizeof(__fp16)),
+                                        row_bytes, st->kd * row_bytes, row_bytes, nc)) {
+                        FARF(ERROR, "conv weight staging DMA queue is full");
+                        abort();
+                    }
                 }
                 for (uint32_t j = 0; j < count; ++j) {
                     dma_queue_pop(q);
@@ -1034,13 +1044,24 @@ static void conv_pack_weight_slice(
         uint32_t oc_start,
         uint32_t oc_count,
         __fp16 * dst) {
+    const bool extended = htp_tensor_is_extended(octx->src[0]);
+    if (extended && (kp->weight_pack_row_stride < (uint64_t) kp->kh * kp->kw * 32u * sizeof(__fp16) ||
+                     (kp->off_weight_pack & 127u) || (kp->weight_pack_row_stride & 127u) ||
+                     (uint64_t) kp->off_weight_pack +
+                         2u * (uint64_t) octx->n_threads * kp->weight_pack_row_stride > kp->vtcm_size ||
+                     kp->vtcm_size > octx->ctx->vtcm_size)) {
+        FARF(ERROR, "conv weight staging exceeds reserved VTCM scratch");
+        abort();
+    }
     const uint32_t n_tiles = (oc_count + 31u) / 32u;
     memset(dst, 0, (size_t) kp->k_tiles * n_tiles * HTP_CONV2D_TILE_BYTES);
     struct conv_weight_pack_state state = {
         .ctx = octx->ctx,
         .src_addr = octx->src[0]->data,
-        .extended = htp_tensor_is_extended(octx->src[0]),
+        .extended = extended,
         .dst = dst,
+        .scratch = (uint8_t *) octx->ctx->vtcm_base + kp->off_weight_pack,
+        .scratch_row_stride = kp->weight_pack_row_stride,
         .kw = kp->kw,
         .kh = kp->kh,
         .kd = kp->kd,

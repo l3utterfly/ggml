@@ -33,7 +33,8 @@ static bool conv2d_layout(
                             uint32_t tile_w, uint32_t tile_h) {
         htp_conv2d_layout_build(result, kh, kw, ic_padded, oc,
                                 n_tiles_per_block, tile_w, tile_h,
-                                htp_session_n_threads(sess), input_element_size);
+                                htp_session_n_threads(sess), input_element_size,
+                                causal3d && opt_dma64 ? htp_session_n_threads(sess) : 0);
         result->kd = kd;
         result->ic = ic;
         result->ic_padded = ic_padded;
