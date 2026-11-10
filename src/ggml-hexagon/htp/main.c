@@ -1124,6 +1124,7 @@ static inline bool mmap_buf(struct htp_context *ctx, struct htp_buf_desc *b) {
 }
 
 static void prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uint32_t n_bufs) {
+    assert(n_bufs <= HTP_MAX_MMAPS);
     uint64_t m_reuse = 0; // mmap reuse mask (index from ctx->mmap array)
     uint32_t b_reuse = 0; // buf reuse count
 
@@ -1162,6 +1163,22 @@ static void prep_op_bufs(struct htp_context *ctx, struct htp_buf_desc *bufs, uin
             }
         }
     }
+
+    // DMA64 mappings consume table slots even though they do not consume the
+    // ordinary virtual-address budget. Retain only as many inactive mappings
+    // as leave room for this batch, after the previous batch has completed.
+    uint32_t free_slots = 0;
+    for (uint32_t i=0; i<HTP_MAX_MMAPS; i++) {
+        if (!ctx->mmap[i].size) free_slots++;
+    }
+    const uint32_t missing = n_bufs - b_reuse;
+    for (uint32_t i=0; i<HTP_MAX_MMAPS && free_slots < missing; i++) {
+        if (ctx->mmap[i].size && !(m_reuse & (1ULL << i))) {
+            drop_mmap(ctx, ctx->mmap + i);
+            free_slots++;
+        }
+    }
+    assert(free_slots >= missing);
 
     // Create missing mappings (pass 1)
     bool mmap_ok = true;
