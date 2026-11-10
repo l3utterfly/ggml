@@ -3345,8 +3345,15 @@ static ggml_backend_buffer_type_t ggml_backend_hexagon_split_buffer_type(int mai
     return &dev_ctx->buffer_type;
 }
 
+static bool ggml_backend_hexagon_is_dma64_enabled(void) {
+    return opt_dma64;
+}
+
 static void * ggml_backend_hexagon_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_hexagon_is_dma64_enabled") == 0) {
+        return (void *) ggml_backend_hexagon_is_dma64_enabled;
+    }
     if (strcmp(name, "ggml_backend_split_buffer_type") == 0) {
         return (void *) ggml_backend_hexagon_split_buffer_type;
     }
