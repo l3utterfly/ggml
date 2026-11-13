@@ -3580,6 +3580,9 @@ static void ggml_hexagon_init(ggml_backend_reg * reg) {
         } else {
             opt_power_mode = m;
         }
+    } else if (opt_arch == 75) {
+        // v75 computes wrong HVX results with the core pinned above TURBO, as burst does.
+        opt_power_mode = HTP_POWER_MODE_BALANCED;
     }
     opt_nhvx      = str_nhvx     ? strtoul(str_nhvx, NULL, 0)             : opt_nhvx;
     opt_nhmx      = str_nhmx     ? atoi(str_nhmx)                         : opt_nhmx;
