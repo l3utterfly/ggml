@@ -40,8 +40,27 @@
 
 #if __HVX_ARCH__ < 79
 
-#define HVX_OP_ADD_F32(a, b) Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(a, b))
-#define HVX_OP_SUB_F32(a, b) Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(a, b))
+// qf32 has no infinities, so before v79 x + -inf (e.g. an attention mask) came back as a
+// large finite value or garbage. Give non-finite operands IEEE add semantics instead:
+// inf + x = inf, NaN propagates, inf + -inf = NaN. Callers pass b already negated for sub.
+static inline HVX_Vector hvx_vec_keep_nonfinite_f32(HVX_Vector a, HVX_Vector b, HVX_Vector r) {
+    const HVX_Vector abs_mask = Q6_V_vsplat_R(0x7fffffff);
+    const HVX_Vector finite_max = Q6_V_vsplat_R(0x7f7fffff);
+    const HVX_Vector inf = Q6_V_vsplat_R(0x7f800000);
+    const HVX_Vector b_abs = Q6_V_vand_VV(b, abs_mask);
+    const HVX_VectorPred a_nonfinite = Q6_Q_vcmp_gt_VuwVuw(Q6_V_vand_VV(a, abs_mask), finite_max);
+    const HVX_VectorPred b_nonfinite = Q6_Q_vcmp_gt_VuwVuw(b_abs, finite_max);
+    const HVX_VectorPred b_nan = Q6_Q_vcmp_gt_VuwVuw(b_abs, inf);
+    const HVX_VectorPred opposite_inf =
+        Q6_Q_and_QQ(a_nonfinite, Q6_Q_vcmp_eq_VwVw(Q6_V_vxor_VV(a, b), Q6_V_vsplat_R(0x80000000)));
+    r = Q6_V_vmux_QVV(a_nonfinite, a, Q6_V_vmux_QVV(b_nonfinite, b, r));
+    r = Q6_V_vmux_QVV(b_nan, b, r);
+    return Q6_V_vmux_QVV(opposite_inf, Q6_V_vsplat_R(0x7fc00000), r);
+}
+
+#define HVX_OP_ADD_F32(a, b) hvx_vec_keep_nonfinite_f32(a, b, Q6_Vsf_equals_Vqf32(Q6_Vqf32_vadd_VsfVsf(a, b)))
+#define HVX_OP_SUB_F32(a, b) \
+    hvx_vec_keep_nonfinite_f32(a, Q6_V_vxor_VV(b, Q6_V_vsplat_R(0x80000000)), Q6_Vsf_equals_Vqf32(Q6_Vqf32_vsub_VsfVsf(a, b)))
 #define HVX_OP_MUL_F32(a, b) Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(a, b))
 
 #else
