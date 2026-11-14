@@ -544,6 +544,96 @@ static int cpy_reshape(struct htp_ops_context * octx, const struct htp_copy_kern
     return HTP_STATUS_OK;
 }
 
+static inline uint16_t cpy_f8_bf16(uint8_t value) {
+    static const uint16_t subnormal[8] = {0, 0x3b00, 0x3b80, 0x3bc0, 0x3c00, 0x3c20, 0x3c40, 0x3c60};
+    const uint32_t magnitude = value & 0x7f;
+    const uint16_t bits = magnitude < 8 ? subnormal[magnitude] :
+                          magnitude == 0x7f ? 0x7fc0 : (magnitude << 4) + 0x3c00;
+    return bits | ((uint16_t) (value & 0x80) << 8);
+}
+
+static void cpy_f8_bf16_worker(unsigned int nth, unsigned int ith, void * data) {
+    const struct htp_copy_context * ct = data;
+    struct htp_ops_context * octx = ct->octx;
+    const struct htp_tensor * src = octx->src[0];
+    const struct htp_tensor * dst = octx->dst;
+    const uint32_t cols = src->ne[0], rows = src->ne[1];
+    const uint32_t col_blocks = (cols + HTP_COPY_F8_COLS - 1) / HTP_COPY_F8_COLS;
+    const uint32_t row_blocks = (rows + 31) / 32;
+    const uint32_t k_tiles = (cols + 31) / 32;
+    const uint32_t jobs_per_plane = col_blocks * row_blocks;
+    uint8_t * input = (uint8_t *) octx->ctx->vtcm_base + ith * HTP_COPY_F8_THREAD_BYTES;
+    uint16_t * output = (uint16_t *) (input + HTP_COPY_F8_INPUT_BYTES);
+    dma_queue * q = octx->ctx->dma[ith];
+
+    for (uint32_t job = ct->row_start + ith; job < ct->row_start + ct->nrows; job += nth) {
+        const uint32_t plane = job / jobs_per_plane;
+        const uint32_t block = job % jobs_per_plane;
+        const uint32_t row = (block / col_blocks) * 32;
+        const uint32_t col = (block % col_blocks) * HTP_COPY_F8_COLS;
+        const uint32_t nr = MIN(32, rows - row);
+        const uint32_t nc = MIN(HTP_COPY_F8_COLS, cols - col);
+        const uint32_t i2 = plane % src->ne[2], i3 = plane / src->ne[2];
+        const dma_addr_t base = src->data + (dma_addr_t) i2 * src->nb[2] + (dma_addr_t) i3 * src->nb[3];
+
+        if (htp_tensor_is_tiled(src)) {
+            const uint32_t tiles = (nc + 31) / 32;
+            const dma_addr_t address = base + ((dma_addr_t) (row / 32) * k_tiles + col / 32) * 1024;
+            dma_queue_push(q, dma_make_data(input, address), tiles * 1024, tiles * 1024, tiles * 1024, 1);
+            dma_queue_pop(q);
+            // Four k-values of eight rows are interleaved in each tile row.
+            // Decode that layout directly instead of unpacking it on the host.
+            for (uint32_t tile = 0; tile < tiles; ++tile) {
+                const uint32_t * words = (const uint32_t *) (input + tile * 1024);
+                for (uint32_t tr = 0; tr < 32; ++tr) {
+                    const uint32_t k = tile * 32 + (tr / 4) * 4;
+                    const uint32_t row0 = (tr % 4) * 8;
+                    for (uint32_t r = 0; r < 8; ++r) {
+                        const uint32_t word = words[tr * 8 + r];
+                        uint16_t * out = output + (row0 + r) * HTP_COPY_F8_COLS + k;
+                        out[0] = cpy_f8_bf16(word);
+                        out[1] = cpy_f8_bf16(word >> 16);
+                        out[2] = cpy_f8_bf16(word >> 8);
+                        out[3] = cpy_f8_bf16(word >> 24);
+                    }
+                }
+            }
+        } else {
+            dma_queue_push(q, dma_make_data(input, base + (dma_addr_t) row * src->nb[1] + col),
+                           HTP_COPY_F8_COLS, src->nb[1], nc, nr);
+            dma_queue_pop(q);
+            for (uint32_t r = 0; r < nr; ++r) {
+                for (uint32_t c = 0; c < nc; ++c) {
+                    output[r * HTP_COPY_F8_COLS + c] = cpy_f8_bf16(input[r * HTP_COPY_F8_COLS + c]);
+                }
+            }
+        }
+        const dma_addr_t address = dst->data + (dma_addr_t) i2 * dst->nb[2] + (dma_addr_t) i3 * dst->nb[3] +
+                                   (dma_addr_t) row * dst->nb[1] + col * 2;
+        dma_queue_push(q, dma_make_data(address, output), dst->nb[1], HTP_COPY_F8_COLS * 2, nc * 2, nr);
+        dma_queue_flush(q);
+    }
+}
+
+static int cpy_f8_bf16_tensor(struct htp_ops_context * octx, const struct htp_copy_kernel_params * kparams) {
+    const struct htp_tensor * src = octx->src[0];
+    const struct htp_tensor * dst = octx->dst;
+    if (src->type != HTP_TYPE_F8_E4M3 || dst->type != HTP_TYPE_BF16 || htp_tensor_is_tiled(dst) ||
+        !htp_ops_context_set_n_threads(octx, kparams->n_threads)) {
+        return HTP_STATUS_INVAL_PARAMS;
+    }
+    if (kparams->vtcm_size > octx->ctx->vtcm_size) {
+        return HTP_STATUS_VTCM_TOO_SMALL;
+    }
+    const uint32_t jobs = ((src->ne[0] + HTP_COPY_F8_COLS - 1) / HTP_COPY_F8_COLS) *
+                          ((src->ne[1] + 31) / 32) * src->ne[2] * src->ne[3];
+    const struct htp_tensor_mdev_range range = htp_tensor_mdev_partition(
+        jobs, 1, octx->ctx->mdev.idx, octx->ctx->mdev.count, &octx->ctx->mdev.count_div);
+    struct htp_copy_context ct = {.octx = octx, .kparams = kparams, .row_start = range.start, .nrows = range.count};
+    work_queue_run(octx->ctx->work_queue, cpy_f8_bf16_worker, &ct, octx->n_threads);
+    return HTP_STATUS_OK;
+}
+
 int op_cpy(struct htp_ops_context * octx) {
     const struct htp_copy_kernel_params * kparams = (const struct htp_copy_kernel_params *) octx->kernel_params;
     int status = HTP_STATUS_OK;
@@ -566,6 +656,9 @@ int op_cpy(struct htp_ops_context * octx) {
             break;
         case HTP_COPY_KERNEL_GATHER_ROWS:
             status = htp_gather_rows(octx, octx->src[0], NULL, &kparams->u.gather, kparams->n_threads);
+            break;
+        case HTP_COPY_KERNEL_F8_BF16:
+            status = cpy_f8_bf16_tensor(octx, kparams);
             break;
         default:
             status = HTP_STATUS_NO_SUPPORT;

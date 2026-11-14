@@ -15,6 +15,7 @@ enum htp_copy_kernel_type {
     HTP_COPY_KERNEL_RESHAPE            = 4,
     HTP_COPY_KERNEL_SCALAR             = 5,
     HTP_COPY_KERNEL_GATHER_ROWS        = 6,
+    HTP_COPY_KERNEL_F8_BF16            = 7,
 };
 
 struct htp_copy_convert_params {
@@ -53,6 +54,12 @@ struct htp_copy_kernel_params {
 // rows at once. The copy kernels keep four per thread (two in flight each way), about
 // 1 MB of VTCM with 8 threads.
 #define HTP_COPY_VTCM_BLK_BYTES (32 * 1024)
+
+// Eight adjacent 32x32 FP8 tiles, followed by their row-major BF16 output.
+#define HTP_COPY_F8_COLS 256u
+#define HTP_COPY_F8_ROWS 32u
+#define HTP_COPY_F8_INPUT_BYTES (HTP_COPY_F8_COLS * HTP_COPY_F8_ROWS)
+#define HTP_COPY_F8_THREAD_BYTES (3u * HTP_COPY_F8_INPUT_BYTES)
 
 struct htp_copy_convert_vtcm_layout {
     size_t   total_bytes;

@@ -2617,6 +2617,29 @@ static bool htp_kparams_solve_cpy(
         return false;
     }
 
+    if (src0->type == GGML_TYPE_F8_E4M3 && dst->type == GGML_TYPE_BF16) {
+        // Only casts into a fresh linear output. Packed inputs are decoded on
+        // the DSP; views into packed weights do not retain a valid tile origin.
+        const int64_t elems = ggml_nelements(src0);
+        if (op->src[1] != op || src0->view_src || dst->view_src ||
+            !ggml_are_same_shape(src0, dst) || !ggml_is_contiguous(src0) ||
+            !ggml_is_contiguous(dst) || elems <= 0 || elems > UINT32_MAX / 2) {
+            return false;
+        }
+        const uint32_t nth = htp_session_n_threads(sess);
+        if (nth == 0 || nth > UINT8_MAX ||
+            nth * HTP_COPY_F8_THREAD_BYTES > htp_session_vtcm_size(sess)) {
+            return false;
+        }
+        kparams->kernel_type = HTP_COPY_KERNEL_F8_BF16;
+        kparams->src0_type_size = 1;
+        kparams->dst_type_size = 2;
+        kparams->total_elems = (uint32_t) elems;
+        kparams->n_threads = (uint8_t) nth;
+        kparams->vtcm_size = nth * HTP_COPY_F8_THREAD_BYTES;
+        return true;
+    }
+
     if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16 && src0->type != GGML_TYPE_I32) {
         return false;
     }
