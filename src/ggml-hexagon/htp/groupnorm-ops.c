@@ -418,7 +418,10 @@ static inline HVX_Vector group_norm_lut32_f16(HVX_Vector index, HVX_Vector table
 static inline HVX_Vector group_norm_silu_f16(HVX_Vector x, HVX_Vector lut_a, HVX_Vector lut_b, HVX_Vector lut_c) {
     const HVX_Vector scaled = hvx_vec_mul_f16_f16(hvx_vec_add_f16_f16(x, Q6_Vh_vsplat_R(0x4800)), Q6_Vh_vsplat_R(0x4000));
     const HVX_Vector index_h = Q6_Vh_equals_Vhf(scaled);
-    const HVX_Vector fraction = hvx_vec_sub_f16_f16(scaled, Q6_Vhf_equals_Vh(index_h));
+    // x + 8 rounds x to 1/128 in half precision; that is enough to pick the
+    // segment but not to place x within it. 2x - (index - 16) is exact.
+    const HVX_Vector fraction = hvx_vec_sub_f16_f16(hvx_vec_add_f16_f16(x, x),
+        Q6_Vhf_equals_Vh(Q6_Vh_vsub_VhVh(index_h, Q6_Vh_vsplat_R(16))));
     const HVX_Vector index = Q6_Vb_vshuffe_VbVb(index_h, index_h);
     const HVX_Vector a = group_norm_lut32_f16(index, lut_a);
     const HVX_Vector b = group_norm_lut32_f16(index, lut_b);
