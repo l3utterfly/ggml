@@ -255,9 +255,7 @@ static bool supports_group_norm(const struct ggml_tensor * op) {
         return false;
     }
     const int32_t groups = ggml_get_op_params_i32(op, 0);
-    return groups > 0 && src->ne[2] % groups == 0 &&
-           (src->type == GGML_TYPE_F16 ||
-            (src->ne[0] * src->ne[1]) % 32 == 0);
+    return groups > 0 && src->ne[2] % groups == 0;
 }
 
 static bool supports_group_norm_affine_silu(const struct ggml_tensor * op) {
@@ -277,9 +275,7 @@ static bool supports_group_norm_affine_silu(const struct ggml_tensor * op) {
     }
 
     const int32_t groups = ggml_get_op_params_i32(op, 0);
-    return groups > 0 && src->ne[2] % groups == 0 &&
-           (src->type == GGML_TYPE_F16 ||
-            (src->ne[0] * src->ne[1]) % 32 == 0);
+    return groups > 0 && src->ne[2] % groups == 0;
 }
 
 bool htp_kparams_solve_vae(const ggml_hexagon_session * sess, const ggml_tensor * op, void * kparams) {

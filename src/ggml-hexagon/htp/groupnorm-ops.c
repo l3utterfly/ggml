@@ -248,6 +248,12 @@ static inline __attribute__((always_inline)) void group_norm_accumulate_f32(stru
     for (; i < nvec; ++i) {
         group_norm_accumulate_vector(acc, 0, src[i]);
     }
+
+    const uint32_t tail = n % 32u;
+    if (tail) {
+        const HVX_Vector x = hvx_vmemu((const float *) data + (size_t) nvec * 32u);
+        group_norm_accumulate_vector(acc, 0, Q6_V_vmux_QVV(Q6_Q_vsetq2_R(tail * sizeof(float)), x, Q6_V_vzero()));
+    }
 }
 
 // Accumulators hold IEEE sf on v79+ and qf32 below (see group_norm_accum_finish).
@@ -325,6 +331,15 @@ static inline __attribute__((always_inline)) void group_norm_stats_dma(const str
     group_norm_accum_finish(&acc, n, mean, mean_square);
 }
 
+static inline __attribute__((always_inline)) HVX_Vector group_norm_apply_f32(HVX_Vector x, HVX_Vector scale, HVX_Vector offset, bool silu, HVX_Vector one, HVX_Vector max_exp, HVX_Vector min_exp) {
+    HVX_Vector y = hvx_vec_add_f32_f32(hvx_vec_mul_f32_f32(x, scale), offset);
+    if (silu) {
+        const HVX_Vector sigmoid = hvx_vec_fast_sigmoid_f32_guard(y, one, max_exp, min_exp);
+        y = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(y, sigmoid));
+    }
+    return y;
+}
+
 static inline __attribute__((always_inline)) void group_norm_transform_f32(const struct group_norm_state * st, uint32_t channel0, uint32_t group_offset, const void * src_data, void * dst_data, uint32_t n, HVX_Vector mean, HVX_Vector inv_std) {
     const float * src = (const float *) src_data;
     float * dst = (float *) dst_data;
@@ -344,18 +359,30 @@ static inline __attribute__((always_inline)) void group_norm_transform_f32(const
         const HVX_Vector bias = hvx_vec_splat_f32(affine ? st->bias[channel] : 0.0f);
         const HVX_Vector scale = hvx_vec_mul_f32_f32(inv_std, weight);
         const HVX_Vector offset_vec = hvx_vec_sub_f32_f32(bias, hvx_vec_mul_f32_f32(mean, scale));
-        const HVX_Vector * input = (const HVX_Vector *) (src + done);
-        HVX_Vector * output = (HVX_Vector *) (dst + done);
         const uint32_t nvec = count / 32u;
 
+        // A plane size that is not a whole number of vectors puts later
+        // channels at unaligned offsets within the staged chunk.
+        if ((((uintptr_t) (src + done) | (uintptr_t) (dst + done)) & 127u) == 0) {
+            const HVX_Vector * input = (const HVX_Vector *) (src + done);
+            HVX_Vector * output = (HVX_Vector *) (dst + done);
 #pragma unroll(4)
-        for (uint32_t i = 0; i < nvec; ++i) {
-            HVX_Vector y = hvx_vec_add_f32_f32(hvx_vec_mul_f32_f32(input[i], scale), offset_vec);
-            if (silu) {
-                const HVX_Vector sigmoid = hvx_vec_fast_sigmoid_f32_guard(y, one, max_exp, min_exp);
-                y = Q6_Vsf_equals_Vqf32(Q6_Vqf32_vmpy_VsfVsf(y, sigmoid));
+            for (uint32_t i = 0; i < nvec; ++i) {
+                output[i] = group_norm_apply_f32(input[i], scale, offset_vec, silu, one, max_exp, min_exp);
             }
-            output[i] = y;
+        } else {
+#pragma unroll(4)
+            for (uint32_t i = 0; i < nvec; ++i) {
+                const HVX_Vector x = hvx_vmemu(src + done + (size_t) i * 32u);
+                hvx_vmemu(dst + done + (size_t) i * 32u) = group_norm_apply_f32(x, scale, offset_vec, silu, one, max_exp, min_exp);
+            }
+        }
+
+        const uint32_t tail = count % 32u;
+        if (tail) {
+            const HVX_Vector x = hvx_vmemu(src + done + (size_t) nvec * 32u);
+            hvx_vec_store_u(dst + done + (size_t) nvec * 32u, tail * sizeof(float),
+                            group_norm_apply_f32(x, scale, offset_vec, silu, one, max_exp, min_exp));
         }
         done += count;
     }
@@ -505,7 +532,8 @@ static void name(unsigned int nth, unsigned int ith, void * data) { \
     } \
 }
 
-GROUP_NORM_WORKER(group_norm_worker_f32, float, slot_bytes / sizeof(float), group_norm_accumulate_f32, group_norm_transform_f32)
+// One vector of headroom keeps a tail load at the end of a full chunk inside its slot.
+GROUP_NORM_WORKER(group_norm_worker_f32, float, slot_bytes / sizeof(float) - 32u, group_norm_accumulate_f32, group_norm_transform_f32)
 GROUP_NORM_WORKER(group_norm_worker_f16, __fp16, (slot_bytes / sizeof(__fp16)) & ~63u, group_norm_accumulate_f16, group_norm_transform_f16)
 
 int op_group_norm(struct htp_ops_context * octx) {
@@ -522,7 +550,7 @@ int op_group_norm(struct htp_ops_context * octx) {
 
     if (!src || !dst ||
         !((src->type == HTP_TYPE_F32 && dst->type == HTP_TYPE_F32) || (f16 && dst->type == HTP_TYPE_F16)) ||
-        groups == 0 || src->ne[2] % groups != 0 || (!f16 && (src->ne[0] * src->ne[1]) % 32u != 0) ||
+        groups == 0 || src->ne[2] % groups != 0 ||
         src->ne[0] != dst->ne[0] || src->ne[1] != dst->ne[1] ||
         src->ne[2] != dst->ne[2] || src->ne[3] != dst->ne[3]) {
         return HTP_STATUS_NO_SUPPORT;
