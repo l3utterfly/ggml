@@ -2896,6 +2896,47 @@ struct test_rope_set_rows : public test_case {
 };
 
 // GGML_OP_RMS_NORM with optional GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW and GGML_OP_SET_ROWS
+// The decomposed interleaved DiT RoPE graph consumed by the OpenCL QKV fusion.
+struct test_dit_qkv_attention : public test_case {
+    std::string op_desc(ggml_tensor *) override { return "DIT_QKV_ATTENTION"; }
+    std::string vars() override { return ""; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        constexpr int d = 64, heads = 2, tokens = 128;
+        auto * packed = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d, 3 * heads, tokens);
+        auto * pe = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, 2, d / 2, tokens);
+        auto * coeffs = ggml_cont(ctx, ggml_permute(ctx, pe, 3, 0, 1, 2));
+        auto plane = [ctx](ggml_tensor * t, int i) {
+            return ggml_view_3d(ctx, t, t->ne[0], t->ne[1], t->ne[2], t->nb[1], t->nb[2], i * t->nb[3]);
+        };
+        ggml_tensor * streams[3];
+        for (int j = 0; j < 3; ++j) {
+            auto * x = ggml_view_3d(ctx, packed, d, heads, tokens, packed->nb[1], packed->nb[2], j * heads * packed->nb[1]);
+            if (j < 2) {
+                auto * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, d);
+                x = ggml_mul(ctx, ggml_rms_norm(ctx, x, 1e-6f), w);
+            }
+            x = ggml_cont(ctx, ggml_permute(ctx, x, 0, 2, 1, 3));
+            if (j < 2) {
+                x = ggml_reshape_4d(ctx, x, 2, d / 2, tokens, heads);
+                x = ggml_cont(ctx, ggml_permute(ctx, x, 3, 0, 1, 2));
+                ggml_tensor * terms[2];
+                for (int i = 0; i < 2; ++i) {
+                    auto * half = ggml_reshape_4d(ctx, plane(x, i), 1, d / 2, tokens, heads);
+                    auto * shape = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 2, d / 2, tokens, heads);
+                    terms[i] = ggml_mul(ctx, ggml_repeat(ctx, half, shape), plane(coeffs, i));
+                }
+                x = ggml_add(ctx, terms[0], terms[1]);
+            }
+            x = ggml_reshape_3d(ctx, x, d, tokens, heads);
+            streams[j] = j == 0 ? x : ggml_cast(ctx, x, GGML_TYPE_F16);
+        }
+        return ggml_flash_attn_ext(ctx, streams[0], streams[1], streams[2], nullptr, 0.125f, 0.f, 0.f);
+    }
+};
+
 struct test_rms_norm_mul_rope : public test_case {
     const std::array<int64_t, 4> ne;
     const float eps;
@@ -10918,6 +10959,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_rms_norm(GGML_TYPE_F32, { n, 5, 4, 3 }, v, eps));
             }
         }
+    }
+
+    test_cases.emplace_back(new test_dit_qkv_attention());
+    for (auto type : {GGML_TYPE_Q4_0, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1}) {
+        test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 256, 192, 256, {1, 1}, {1, 1}));
     }
 
     // in-place tests
