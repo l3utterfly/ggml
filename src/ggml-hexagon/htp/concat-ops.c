@@ -12,6 +12,7 @@
 #include "htp-tensor.h"
 #include "htp-vtcm.h"
 #include "hvx-utils.h"
+#include "hvx-copy.h"
 #include "hvx_hexagon_protos.h"
 #include "gather-rows.h"
 
@@ -228,10 +229,135 @@ static void concat_2d_f16_transposed(unsigned int nth, unsigned int ith, void * 
     dma_queue_flush(dma_q);
 }
 
+#define CONCAT_CONTIG_PIECE (64u * 1024u)
+
+struct htp_concat_contig_context {
+    struct htp_ops_context * octx;
+    uint32_t outer;    // product of dst->ne above dim
+    uint32_t bytes0;   // src0 bytes per outer index
+    uint32_t bytes1;   // src1 bytes per outer index
+    uint32_t pieces0;  // CONCAT_CONTIG_PIECE pieces in bytes0
+    uint32_t pieces1;
+};
+
+static void concat_contig(unsigned int nth, unsigned int ith, void * data) {
+    const struct htp_concat_contig_context * c = (const struct htp_concat_contig_context *) data;
+    const struct htp_ops_context * octx = c->octx;
+
+    const uint8_t * s0 = (const uint8_t *) (uintptr_t) octx->src[0]->data;
+    const uint8_t * s1 = (const uint8_t *) (uintptr_t) octx->src[1]->data;
+    uint8_t *       d  = (uint8_t *) (uintptr_t) octx->dst->data;
+
+    const uint32_t per   = c->pieces0 + c->pieces1;
+    const uint32_t total = c->outer * per;
+    const uint32_t chunk = (total + nth - 1) / nth;
+    const uint32_t start = MIN(ith * chunk, total);
+    const uint32_t end   = MIN(start + chunk, total);
+
+    for (uint32_t u = start; u < end; u++) {
+        const uint32_t o    = u / per;
+        uint32_t       p    = u - o * per;
+        uint8_t *      drow = d + (size_t) o * (c->bytes0 + c->bytes1);
+        if (p < c->pieces0) {
+            const uint32_t off = p * CONCAT_CONTIG_PIECE;
+            hvx_copy_uu(drow + off, s0 + (size_t) o * c->bytes0 + off, MIN(CONCAT_CONTIG_PIECE, c->bytes0 - off), 1);
+        } else {
+            p -= c->pieces0;
+            const uint32_t off = p * CONCAT_CONTIG_PIECE;
+            hvx_copy_uu(drow + c->bytes0 + off, s1 + (size_t) o * c->bytes1 + off,
+                        MIN(CONCAT_CONTIG_PIECE, c->bytes1 - off), 1);
+        }
+    }
+}
+
+static void concat_rows(unsigned int nth, unsigned int ith, void * data) {
+    const struct htp_ops_context * octx = data;
+
+    const struct htp_tensor * src0 = octx->src[0];
+    const struct htp_tensor * src1 = octx->src[1];
+    const struct htp_tensor * dst  = octx->dst;
+
+    const int      dim       = ((const struct htp_concat_kernel_params *) octx->kernel_params)->dim;
+    const uint32_t type_size = (dst->type == HTP_TYPE_F32 || dst->type == HTP_TYPE_I32) ? 4 : 2;
+
+    const uint32_t ne1   = dst->ne[1];
+    const uint32_t ne2   = dst->ne[2];
+    const uint32_t nrows = ne1 * ne2 * dst->ne[3];
+    if (nrows == 0) {
+        return;
+    }
+    const struct fastdiv_values div_ne1 = init_fastdiv_values(ne1);
+    const struct fastdiv_values div_ne2 = init_fastdiv_values(ne2);
+    const uint32_t chunk = (nrows + nth - 1) / nth;
+    const uint32_t start = MIN(ith * chunk, nrows);
+    const uint32_t end   = MIN(start + chunk, nrows);
+
+    for (uint32_t r = start; r < end; r++) {
+        const uint32_t q  = fastdiv(r, &div_ne1);
+        const uint32_t i1 = r - q * ne1;
+        const uint32_t i3 = fastdiv(q, &div_ne2);
+        const uint32_t i2 = q - i3 * ne2;
+
+        uint8_t * d = (uint8_t *) (uintptr_t) dst->data + i1 * dst->nb[1] + i2 * dst->nb[2] + i3 * dst->nb[3];
+
+        if (dim == 0) {
+            const uint8_t * a = (const uint8_t *) (uintptr_t) src0->data + i1 * src0->nb[1] + i2 * src0->nb[2] + i3 * src0->nb[3];
+            const uint8_t * b = (const uint8_t *) (uintptr_t) src1->data + i1 * src1->nb[1] + i2 * src1->nb[2] + i3 * src1->nb[3];
+            hvx_copy_uu(d, a, src0->ne[0] * type_size, 1);
+            hvx_copy_uu(d + src0->ne[0] * type_size, b, src1->ne[0] * type_size, 1);
+            continue;
+        }
+
+        uint32_t s1 = i1, s2 = i2, s3 = i3;
+        const uint32_t idx = (dim == 1) ? i1 : (dim == 2) ? i2 : i3;
+        const struct htp_tensor * src = src0;
+        if (idx >= src0->ne[dim]) {
+            src = src1;
+            if (dim == 1) s1 -= src0->ne[1];
+            else if (dim == 2) s2 -= src0->ne[2];
+            else s3 -= src0->ne[3];
+        }
+        const uint8_t * s = (const uint8_t *) (uintptr_t) src->data + s1 * src->nb[1] + s2 * src->nb[2] + s3 * src->nb[3];
+        hvx_copy_uu(d, s, dst->ne[0] * type_size, 1);
+    }
+}
+
 static int concat_regular(struct htp_ops_context * octx, int dim, uint32_t type_size) {
     const struct htp_tensor * src0 = octx->src[0];
     const struct htp_tensor * src1 = octx->src[1];
     const struct htp_tensor * dst  = octx->dst;
+
+    const bool directly_addressable = octx->ctx->mdev.count <= 1 && !htp_tensor_is_extended(src0) &&
+                                      !htp_tensor_is_extended(src1) && !htp_tensor_is_extended(dst);
+    if (directly_addressable &&
+        htp_tensor_is_contiguous(src0, type_size) && htp_tensor_is_contiguous(src1, type_size) &&
+        htp_tensor_is_contiguous(dst, type_size)) {
+        struct htp_concat_contig_context c;
+        uint32_t elems0 = 1, elems1 = 1, outer = 1;
+        for (int k = 0; k <= dim; k++) {
+            elems0 *= src0->ne[k];
+            elems1 *= src1->ne[k];
+        }
+        for (int k = dim + 1; k < HTP_OP_MAX_DIMS; k++) {
+            outer *= dst->ne[k];
+        }
+        c.octx    = octx;
+        c.outer   = outer;
+        c.bytes0  = elems0 * type_size;
+        c.bytes1  = elems1 * type_size;
+        c.pieces0 = c.bytes0 / CONCAT_CONTIG_PIECE + (c.bytes0 % CONCAT_CONTIG_PIECE != 0);
+        c.pieces1 = c.bytes1 / CONCAT_CONTIG_PIECE + (c.bytes1 % CONCAT_CONTIG_PIECE != 0);
+        if (outer == 0 || c.pieces0 + c.pieces1 == 0) {
+            return HTP_STATUS_OK;
+        }
+        work_queue_run(octx->ctx->work_queue, concat_contig, &c, octx->n_threads);
+        return HTP_STATUS_OK;
+    }
+
+    if (directly_addressable) {
+        work_queue_run(octx->ctx->work_queue, concat_rows, octx, octx->n_threads);
+        return HTP_STATUS_OK;
+    }
 
     struct htp_tensor view0 = *dst;
     struct htp_tensor view1 = *dst;

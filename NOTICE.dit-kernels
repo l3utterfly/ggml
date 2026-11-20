@@ -1,0 +1,19 @@
+Android DiT kernel changes adapted from Nightmare Mobile
+Copyright (c) 2026 Abraham Paul Jaison
+
+https://github.com/AbrahamPaulJ/nightmare-mobile/tree/aa512f4f03ad61bec927c03134fb1d8dc8ca3952/backend-patches/dit
+
+Hexagon patches 030, 031, 039, 040, 041, 063 and 065 were adapted to
+this fork's session lifetime, tensor address ranges, DMA queues, VTCM
+layout and masked attention. The session self-test is opt-in here.
+OpenCL patches 067, 080, 081 and 085 were adapted to this fork's
+device discovery, graph execution and shared-library build.
+
+Nightmare Mobile identifies its own contributions as CC BY-NC 4.0.
+https://creativecommons.org/licenses/by-nc/4.0/
+https://github.com/AbrahamPaulJ/nightmare-mobile/blob/aa512f4f03ad61bec927c03134fb1d8dc8ca3952/NOTICE
+
+Patch 067 incorporates the Mali and older-driver work from Fancy AI
+(Apache-2.0), https://github.com/Mr-J-369/Fancy-Ai .
+Patch 081 incorporates happyyzy's QKV preprocessing changes (MIT),
+https://github.com/ggml-org/llama.cpp/pull/28446 .

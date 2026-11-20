@@ -328,6 +328,7 @@ struct ggml_hexagon_session {
 
     uint32_t n_threads   = 0;
     uint32_t n_hvx       = 0;
+    std::once_flag hmx_selftest_once;
     uint32_t n_hmx       = 0;
     uint64_t vtcm_size   = 0;
     size_t   max_vmem    = 0;
@@ -3022,18 +3023,94 @@ bool ggml_backend_is_hexagon(ggml_backend_t backend) {
 
 // device interface
 
+static void ggml_hexagon_hmx_selftest(ggml_backend_t backend, ggml_backend_dev_t dev, ggml_hexagon_session * sess) {
+    const int64_t K = 256, M = 256, N = 64;
+    ggml_init_params pw = { ggml_tensor_overhead(), nullptr, true };
+    ggml_init_params pa = { 4 * ggml_tensor_overhead() + ggml_graph_overhead(), nullptr, true };
+    ggml_context *   cw = ggml_init(pw);
+    ggml_context *   ca = ggml_init(pa);
+    ggml_tensor *    w  = ggml_new_tensor_2d(cw, GGML_TYPE_Q4_0, K, M);
+    ggml_tensor *    x  = ggml_new_tensor_2d(ca, GGML_TYPE_F32, K, N);
+    ggml_tensor *    y  = ggml_mul_mat(ca, w, x);  // [M, N]
+    ggml_cgraph *    gf = ggml_new_graph(ca);
+    ggml_build_forward_expand(gf, y);
+
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+    ggml_backend_buffer_t      bw   = ggml_backend_alloc_ctx_tensors_from_buft(cw, buft);
+    ggml_backend_buffer_t      ba   = bw ? ggml_backend_alloc_ctx_tensors_from_buft(ca, buft) : nullptr;
+    if (!bw || !ba) {
+        GGML_LOG_WARN("ggml-hex: %s HMX self-test: no buffer\n", sess->c_name());
+    } else {
+        ggml_backend_buffer_set_usage(bw, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+        std::vector<float> wf(K * M), xf(K * N);
+        uint32_t           seed = 12345;
+        auto rnd = [&seed]() {
+            seed = seed * 1664525u + 1013904223u;
+            return (float) ((seed >> 8) & 0xffff) / 32768.0f - 1.0f;
+        };
+        for (auto & v : wf) { v = rnd(); }
+        for (auto & v : xf) { v = rnd(); }
+        std::vector<uint8_t> wq(ggml_row_size(GGML_TYPE_Q4_0, K) * M);
+        ggml_quantize_chunk(GGML_TYPE_Q4_0, wf.data(), wq.data(), 0, M, K, nullptr);
+        ggml_backend_tensor_set(w, wq.data(), 0, wq.size());
+        ggml_backend_tensor_set(x, xf.data(), 0, xf.size() * sizeof(float));
+
+        const ggml_status  st = ggml_backend_graph_compute(backend, gf);
+        std::vector<float> yf(M * N, 0.0f);
+        if (st == GGML_STATUS_SUCCESS) {
+            ggml_backend_tensor_get(y, yf.data(), 0, yf.size() * sizeof(float));
+        }
+
+        std::vector<float> wd(K * M);
+        ggml_get_type_traits(GGML_TYPE_Q4_0)->to_float(wq.data(), wd.data(), K * M);
+        double err2 = 0.0, ref2 = 0.0, out2 = 0.0, maxerr = 0.0;
+        for (int64_t n = 0; n < N; n++) {
+            for (int64_t m = 0; m < M; m++) {
+                double ref = 0.0;
+                for (int64_t k = 0; k < K; k++) {
+                    ref += (double) wd[m * K + k] * (double) xf[n * K + k];
+                }
+                const double out = yf[n * M + m];
+                err2 += (out - ref) * (out - ref);
+                ref2 += ref * ref;
+                out2 += out * out;
+                maxerr = std::max(maxerr, std::fabs(out - ref));
+            }
+        }
+        const double rel   = std::sqrt(err2 / std::max(ref2, 1e-30));
+        const double ratio = std::sqrt(out2 / std::max(ref2, 1e-30));
+        const char * verdict = st != GGML_STATUS_SUCCESS ? "FAILED"
+                             : rel < 0.05                ? "ok"
+                             : ratio < 0.01              ? "WRONG (zeros)"
+                                                         : "WRONG";
+        // The explicitly requested verdict must also be visible in GGML_QUIET_LOGS builds.
+        fprintf(stderr, "ggml-hex: %s HMX self-test: %s, rel-err %.4f, out/ref %.3f, max-err %.3g\n",
+                sess->c_name(), verdict, rel, ratio, maxerr);
+    }
+    if (ba) { ggml_backend_buffer_free(ba); }
+    if (bw) { ggml_backend_buffer_free(bw); }
+    ggml_free(ca);
+    ggml_free(cw);
+}
+
 static ggml_backend_t ggml_backend_hexagon_device_init(ggml_backend_dev_t dev, const char * params) {
     auto dev_ctx = static_cast<ggml_backend_hexagon_device_context *>(dev->context);
     auto sess    = dev_ctx->session();
 
-    return new ggml_backend{
+    GGML_UNUSED(params);
+    auto backend = new ggml_backend{
         /* .guid      = */ ggml_backend_hexagon_guid(),
         /* .interface = */ hexagon_backend_i,
         /* .device    = */ dev,
         /* .context   = */ sess,
     };
 
-    GGML_UNUSED(params);
+    const char * selftest = getenv("NM_HMX_SELFTEST");
+    if (sess->n_hmx && selftest && atoi(selftest) != 0) {
+        std::call_once(sess->hmx_selftest_once, ggml_hexagon_hmx_selftest, backend, dev, sess);
+    }
+    return backend;
 }
 
 static const char * ggml_backend_hexagon_device_get_name(ggml_backend_dev_t dev) {

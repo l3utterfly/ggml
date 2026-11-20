@@ -8,6 +8,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 
 #ifndef M_LOG2E
 #    define M_LOG2E 1.44269504088896340736
@@ -510,6 +512,19 @@ static bool htp_kparams_solve_flash_attn(
         size_t Br = 0, Bc = 0;
         int ret = hmx_fa_find_chunk_size(&Br, &Bc, G, DK_pad, DV_pad, neq1, nek1, vtcm_size, n_threads, (q->type == GGML_TYPE_F32), sinks != nullptr, n_head, fa_team_size);
         if (ret == 0) {
+            static const char * brbc = std::getenv("GGML_HEXAGON_FA_BRBC");
+            unsigned br = 0, bc = 0;
+            char extra;
+            if (brbc && std::sscanf(brbc, "%u,%u%c", &br, &bc, &extra) == 2 &&
+                br > 0 && br <= hex_round_up(neq1, 32) && br <= UINT16_MAX / G &&
+                br % ((32 + G - 1) / G) == 0 && bc > 0 && bc <= UINT16_MAX && bc % 64 == 0) {
+                const bool pipeline = (nek1 + (size_t) bc - 1) / bc >= 3 && n_threads >= 2;
+                if (hmx_fa_compute_vtcm_usage(G, DK_pad, DV_pad, br, bc, pipeline ? n_threads : 1, pipeline,
+                                              q->type == GGML_TYPE_F32, sinks != nullptr, n_head) <= vtcm_size) {
+                    Br = br;
+                    Bc = bc;
+                }
+            }
             kparams->kernel_type = HTP_FA_KERNEL_HMX;
             if (logit_softcap == 0.0f) {
                 kparams->scale         = scale * (float) M_LOG2E;
@@ -2573,7 +2588,7 @@ static bool htp_kparams_solve_concat(
     const bool dma_strides_ok = (src0->nb[0] == type_size && src1->nb[0] == type_size && dst->nb[0] == type_size);
     if (dma_strides_ok) {
         kparams->kernel_type = HTP_CONCAT_KERNEL_REGULAR;
-        kparams->n_threads   = 1;
+        kparams->n_threads   = mdev_count > 1 ? 1 : n_threads;
         return true;
     }
 

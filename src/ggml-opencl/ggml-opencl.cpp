@@ -33,10 +33,19 @@ typedef const void * (*get_adreno_bin_kernel_func_t)(
 
 #include <CL/cl.h>
 
+#ifndef CL_DEVICE_SUB_GROUP_SIZES_KHR
+#define CL_DEVICE_SUB_GROUP_SIZES_KHR 0x1058
+#endif
+
 #include <inttypes.h>
 #include <string.h>
+#ifndef _WIN32
+#include <dlfcn.h>
+#endif
 
 #include <cstddef>
+#include <chrono>
+#include <thread>
 #include <cstdint>
 #include <fstream>
 #include <vector>
@@ -113,6 +122,7 @@ static fastdiv_vals init_fastdiv_values(uint64_t d_64) {
 enum GPU_FAMILY {
     ADRENO,
     INTEL,
+    MALI,
     UNKNOWN,
 };
 
@@ -471,6 +481,7 @@ struct ggml_backend_opencl_device_context {
 
     GPU_FAMILY     gpu_family = GPU_FAMILY::UNKNOWN;
     ADRENO_GPU_GEN adreno_gen = ADRENO_GPU_GEN::ADRENO_UNKNOWN;
+    size_t subgroup_size = 0;
 
     std::regex *opfilter = nullptr; // regex of ops to not claim
     std::string opfilter_str = ""; // regex string for opfilter
@@ -656,6 +667,7 @@ struct ggml_backend_opencl_context {
 
     GPU_FAMILY gpu_family;
     ADRENO_GPU_GEN adreno_gen;
+    size_t subgroup_size;
 
     cl_int alignment;
     size_t global_mem_size;
@@ -728,6 +740,7 @@ struct ggml_backend_opencl_context {
     // scratch copy of the router weights to avoid dst aliasing
     ggml_cl_buffer prealloc_moe_combine_w;
     ggml_cl_buffer prealloc_splitk_partial;  // [ksplit * M] partials for split-K GEMV
+    ggml_cl_buffer prealloc_fused_qkv;
 
     // pool of persistent image1d_buffer views over kv-cache layers, keyed by
     // (parent buffer, offset within parent)
@@ -913,6 +926,7 @@ struct ggml_backend_opencl_context {
     cl_kernel kernel_adreno_xmem_prepack_weight_f16;
     cl_kernel kernel_gemm_xmem_f16_f32_os8;
     cl_kernel kernel_adreno_xmem_store_dst_f32;
+    cl_kernel kernel_fused_qknorm_rope_f32 = nullptr;
     cl_kernel kernel_mul_mm_f16_f32_kqv;
     cl_kernel kernel_mul_mm_f16_f32_kq;
     cl_kernel kernel_mul_mat_q4_0_f32, kernel_mul_mat_q4_0_f32_v;
@@ -2967,7 +2981,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
     // gemm_xmem_f16_f32_os8
-    {
+    if (backend_ctx->gpu_family == GPU_FAMILY::ADRENO) {
 #ifdef GGML_OPENCL_EMBED_KERNELS
         const std::string kernel_src {
             #include "gemm_xmem_f16_f32_os8.cl.h"
@@ -3047,6 +3061,25 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
         cl_program program = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
         CL_CHECK((backend_ctx->kernel_qknorm_rope_f32 =
             clCreateKernel(program, "kernel_qknorm_rope_f32", &err), err));
+        CL_CHECK(clReleaseProgram(program));
+        GGML_LOG_CONT(".");
+    }
+#endif // GGML_OPENCL_USE_ADRENO_KERNELS
+
+#ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+    // fused_qknorm_rope
+    if (backend_ctx->gpu_family == GPU_FAMILY::ADRENO) {
+#ifdef GGML_OPENCL_EMBED_KERNELS
+        const std::string kernel_src {
+            #include "fused_qknorm_rope.cl.h"
+        };
+#else
+        const std::string kernel_src = read_file("fused_qknorm_rope.cl");
+#endif
+        cl_program program = build_program_from_source(backend_ctx, kernel_src.c_str(), compile_opts);
+
+        CL_CHECK((backend_ctx->kernel_fused_qknorm_rope_f32 =
+            clCreateKernel(program, "kernel_fused_qknorm_rope_f32", &err), err));
         CL_CHECK(clReleaseProgram(program));
         GGML_LOG_CONT(".");
     }
@@ -4081,11 +4114,7 @@ static void load_cl_kernels(ggml_backend_opencl_context *backend_ctx) {
     #endif
 
         const int gdn_sizes[4] = { 16, 32, 64, 128 };
-        const int sg_size = backend_ctx->gpu_family == GPU_FAMILY::ADRENO ? 64 : backend_ctx->gpu_family == GPU_FAMILY::INTEL ? 32 : -1;
-        if (sg_size < 0) {
-            GGML_LOG_ERROR("Unsupported GPU Family: only Adreno and Intel are supported.\n");
-            exit(1);
-        }
+        const int sg_size = (int) backend_ctx->subgroup_size;
 
         for (int si = 0; si < 4; si++) {
             const int S_V = gdn_sizes[si];
@@ -6217,8 +6246,8 @@ static std::string ggml_opencl_fa_compile_opts(ggml_backend_opencl_context * bac
         " -D BLOCK_M=" + std::to_string(cfg->bm) +
         " -D BLOCK_N=" + std::to_string(cfg->bn);
 
-    if (backend_ctx->gpu_family == INTEL) {
-        opts += " -D FA_SG=32";
+    if (backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI) {
+        opts += " -D FA_SG=" + std::to_string(backend_ctx->subgroup_size);
     }
 
     const bool is_split = variant == FA_VARIANT_F32_F16_SPLIT ||
@@ -6895,7 +6924,8 @@ static bool ggml_opencl_ensure_fa_variant(ggml_backend_opencl_context * backend_
                     cl_kernel k_c8 = clCreateKernel(prog_c8, "flash_attn_f32_f16_q1_vec_mq_split_c8", &err);
                     if (err == CL_SUCCESS) {
                         // WG = MQ_NSG(2) × Q1_WG_SIZE(=FA_SG): 128 Adreno (64), 64 Intel (32).
-                        const size_t c8_ns2_wg = backend_ctx->gpu_family == INTEL ? 64 : 128;
+                        const size_t c8_ns2_wg = backend_ctx->gpu_family == ADRENO
+                            ? 128 : backend_ctx->subgroup_size * 2;
                         if (ggml_opencl_fa_kernel_fits_wg(backend_ctx, k_c8, c8_ns2_wg,
                                                           "flash_attn_f32_f16_q1_vec_mq_split_c8 (ns2)", dk, dv)) {
                             backend_ctx->fa.f32_f16_q1_vec_mq_split_c8_ns2[{dk, dv}] = k_c8;
@@ -7514,10 +7544,17 @@ static bool ggml_opencl_is_device_supported(ggml_backend_dev_t dev) {
         }
     } else if (strstr(dev_ctx->device_name.c_str(), "Intel")) {
         dev_ctx->gpu_family = GPU_FAMILY::INTEL;
+        dev_ctx->subgroup_size = 32;
+    } else if (strstr(dev_ctx->device_name.c_str(), "Mali") ||
+               strstr(dev_ctx->device_version.c_str(), "Mali")) {
+        dev_ctx->gpu_family = GPU_FAMILY::MALI;
     } else {
         GGML_LOG_WARN("ggml_opencl: unsupported GPU '%s'.\n", dev_ctx->device_name.c_str());
         dev_ctx->gpu_family = GPU_FAMILY::UNKNOWN;
         return false;
+    }
+    if (dev_ctx->gpu_family == GPU_FAMILY::ADRENO) {
+        dev_ctx->subgroup_size = 64;
     }
 
     ggml_cl_version platform_version = get_opencl_platform_version(dev_ctx->platform);
@@ -7530,9 +7567,9 @@ static bool ggml_opencl_is_device_supported(ggml_backend_dev_t dev) {
     }
 
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
-    if (dev_ctx->gpu_family != GPU_FAMILY::ADRENO) {
+    if (dev_ctx->gpu_family != GPU_FAMILY::ADRENO && dev_ctx->gpu_family != GPU_FAMILY::MALI) {
         GGML_LOG_WARN("ggml_opencl: Adreno-specific kernels should not be enabled for non-Adreno GPUs; "
-            "run on an Adreno GPU or recompile with CMake option `-DGGML_OPENCL_USE_ADRENO_KERNELS=OFF`\n");
+            "run on an Adreno or Mali GPU, or recompile with CMake option `-DGGML_OPENCL_USE_ADRENO_KERNELS=OFF`\n");
         return false;
     }
 #endif
@@ -7558,6 +7595,42 @@ static bool ggml_opencl_is_device_supported(ggml_backend_dev_t dev) {
         GGML_LOG_WARN("ggml_opencl: device does not support subgroups (cl_khr_subgroups or cl_intel_subgroups) "
             "(note that subgroups is an optional feature in OpenCL 3.0)\n");
         return false;
+    }
+
+    if (dev_ctx->gpu_family == GPU_FAMILY::MALI) {
+        if (strstr(ext_buffer.data(), "cl_khr_subgroups") == NULL) {
+            GGML_LOG_WARN("ggml_opencl: Mali requires cl_khr_subgroups for subgroup kernels\n");
+            return false;
+        }
+
+        size_t subgroup_sizes_bytes = 0;
+        cl_int subgroup_status = clGetDeviceInfo(
+            dev_ctx->device, CL_DEVICE_SUB_GROUP_SIZES_KHR, 0, NULL, &subgroup_sizes_bytes);
+        if (subgroup_status != CL_SUCCESS ||
+            (subgroup_sizes_bytes != sizeof(size_t) && subgroup_sizes_bytes != sizeof(cl_uint))) {
+            GGML_LOG_WARN("ggml_opencl: Mali must report one fixed subgroup size; query status=%d bytes=%zu\n",
+                subgroup_status, subgroup_sizes_bytes);
+            return false;
+        }
+
+        if (subgroup_sizes_bytes == sizeof(cl_uint)) {
+            cl_uint subgroup_size = 0;
+            subgroup_status = clGetDeviceInfo(
+                dev_ctx->device, CL_DEVICE_SUB_GROUP_SIZES_KHR,
+                sizeof(subgroup_size), &subgroup_size, NULL);
+            dev_ctx->subgroup_size = subgroup_size;
+        } else {
+            subgroup_status = clGetDeviceInfo(
+                dev_ctx->device, CL_DEVICE_SUB_GROUP_SIZES_KHR,
+                sizeof(dev_ctx->subgroup_size), &dev_ctx->subgroup_size, NULL);
+        }
+        if (subgroup_status != CL_SUCCESS || dev_ctx->subgroup_size == 0 ||
+            (dev_ctx->subgroup_size & (dev_ctx->subgroup_size - 1)) != 0) {
+            GGML_LOG_WARN("ggml_opencl: Mali reported invalid subgroup size=%zu status=%d\n",
+                dev_ctx->subgroup_size, subgroup_status);
+            return false;
+        }
+        GGML_LOG_INFO("ggml_opencl: Mali subgroup size=%zu\n", dev_ctx->subgroup_size);
     }
 
     clGetDeviceInfo(dev_ctx->device, CL_DEVICE_GLOBAL_MEM_SIZE, sizeof(size_t), &dev_ctx->global_mem_size, NULL);
@@ -7596,6 +7669,7 @@ static ggml_backend_opencl_context * ggml_cl_init(ggml_backend_dev_t dev) {
 
     backend_ctx->gpu_family = dev_ctx->gpu_family;
     backend_ctx->adreno_gen = dev_ctx->adreno_gen;
+    backend_ctx->subgroup_size = dev_ctx->subgroup_size;
     if (backend_ctx->gpu_family == GPU_FAMILY::ADRENO) {
         ggml_cl_init_fa_dims_table();
 
@@ -9330,10 +9404,7 @@ static void ggml_opencl_op_rms_norm_mul_add_fused(ggml_backend_t backend, ggml_t
 
     GGML_ASSERT(ne00 % 4 == 0);
 
-    size_t sgs;
-    if (backend_ctx->gpu_family == ADRENO) sgs = 64;
-    else if (backend_ctx->gpu_family == INTEL) sgs = 32;
-    else GGML_ASSERT(false && "Unsupported GPU");
+    const size_t sgs = backend_ctx->subgroup_size;
 
     cl_kernel kernel = backend_ctx->kernel_rms_norm_mul_add;
 
@@ -9384,8 +9455,217 @@ static void ggml_opencl_op_rms_norm_mul_add_fused(ggml_backend_t backend, ggml_t
     backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
 }
 
+// nightmare (dit/080): the yield settings ([ggml_backend_opencl_graph_compute]) and the longest wait of the graph
+// being computed, which a split matmul's chunks ([ggml_cl_mul_mat]) report into too.
+static int  nm_yield_every() { static const int v = [] { const char * e = getenv("GGML_OPENCL_YIELD_EVERY"); return e ? atoi(e) : 0; }(); return v; }
+static int  nm_yield_us()    { static const int v = [] { const char * e = getenv("GGML_OPENCL_YIELD_US"); return e ? atoi(e) : 2000; }(); return v; }
+static thread_local double      nm_yield_max_ms   = 0.0;
+static thread_local const char * nm_yield_max_name = "-";
+static thread_local const char * nm_yield_max_op   = "-";
+static thread_local char         nm_yield_max_shape[96] = "";
+
+// ⭐ Waits for the queue, records how long it took against [node], and gives the screen [nm_yield_us].
+// [chunk] marks a wait between the token chunks of a split matmul.
+static double nm_yield_now(ggml_backend_opencl_context * backend_ctx, const ggml_tensor * node, bool chunk = false) {
+    const auto t0 = std::chrono::steady_clock::now();
+    clFinish(backend_ctx->queue);
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    if (ms > nm_yield_max_ms) {
+        nm_yield_max_ms   = ms;
+        nm_yield_max_name = node ? node->name : "-";
+        nm_yield_max_op   = node ? ggml_op_desc(node) : "-";
+        nm_yield_max_shape[0] = 0;
+        if (node && node->src[0] && node->src[1]) {
+            snprintf(nm_yield_max_shape, sizeof(nm_yield_max_shape), " %s [%lld x %lld] x [%lld x %lld x %lld]%s%s",
+                     ggml_type_name(node->src[0]->type), (long long) node->src[0]->ne[0], (long long) node->src[0]->ne[1],
+                     (long long) node->src[1]->ne[0], (long long) node->src[1]->ne[1], (long long) node->src[1]->ne[2],
+                     ggml_is_contiguous(node->src[1]) ? "" : " src1-strided", chunk ? " (a chunk)" : "");
+        }
+    }
+    if (nm_yield_us() > 0) {
+        std::this_thread::sleep_for(std::chrono::microseconds(nm_yield_us()));
+    }
+    return ms;
+}
+
+struct ggml_opencl_qkv_preprocess {
+    const ggml_tensor * src[2][3] = {};
+    const ggml_tensor * weight[2][2] = {};
+    const ggml_tensor * pe = nullptr;
+    const ggml_tensor * attn = nullptr;
+    float eps[2][2] = {};
+    float scale[2] = {1.0f, 1.0f};
+    int n_streams = 1;
+    std::vector<int> nodes;
+};
+
+static void ggml_opencl_op_qkv_preprocess(ggml_backend_t backend, const ggml_opencl_qkv_preprocess & match);
+
+static const ggml_tensor * ggml_opencl_match_qkv_rope(const ggml_tensor * out, const ggml_tensor * & pe,
+                                                       std::vector<const ggml_tensor *> & nodes) {
+    if (out->op != GGML_OP_RESHAPE || out->src[0]->op != GGML_OP_ADD || out->ne[0] % 2 != 0) { return nullptr; }
+    const auto * add = out->src[0];
+    const int64_t d = out->ne[0], l = out->ne[1], heads = out->ne[2] * out->ne[3];
+    const int64_t rotated_shape[] = {2, d / 2, l, heads}, pe_shape[] = {2, 2, d / 2, l};
+    const int32_t split_axes[] = {3, 0, 1, 2}, head_axes[] = {0, 2, 1, 3};
+    if (memcmp(add->ne, rotated_shape, sizeof(rotated_shape)) != 0) { return nullptr; }
+    nodes.insert(nodes.end(), {out, add});
+    const ggml_tensor * packed = nullptr, * coeffs = nullptr;
+    for (int b = 0; b < 2; ++b) {
+        const auto * t = add->src[b];
+        const ggml_tensor * x[4];
+        int j = 0;
+        for (ggml_op op : {GGML_OP_MUL, GGML_OP_REPEAT, GGML_OP_RESHAPE, GGML_OP_VIEW}) {
+            if (!t || t->op != op) { return nullptr; }
+            x[j++] = t;
+            nodes.push_back(t);
+            t = t->src[0];
+        }
+        const auto * p = x[0]->src[1];
+        if (!t || (packed && packed != t) || p->op != GGML_OP_VIEW ||
+            (coeffs && coeffs != p->src[0])) { return nullptr; }
+        packed = t;
+        coeffs = p->src[0];
+        nodes.push_back(p);
+        if (x[2]->ne[0] != 1 || !ggml_is_contiguous(x[3]) || !ggml_is_contiguous(p) || p->ne[3] != 1 ||
+            ggml_nelements(x[3]) * 2 != ggml_nelements(packed) || ggml_nelements(p) * 2 != ggml_nelements(coeffs) ||
+            x[3]->view_offs != b * ggml_nbytes(packed) / 2 || p->view_offs != b * ggml_nbytes(coeffs) / 2) { return nullptr; }
+    }
+    const ggml_tensor * x[5];
+    const auto * t = packed;
+    int j = 0;
+    for (ggml_op op : {GGML_OP_CONT, GGML_OP_PERMUTE, GGML_OP_RESHAPE, GGML_OP_CONT, GGML_OP_PERMUTE}) {
+        if (!t || t->op != op) { return nullptr; }
+        x[j++] = t;
+        nodes.push_back(t);
+        t = t->src[0];
+    }
+    if (!t || t->type != GGML_TYPE_F32 || t->ne[0] != d || t->ne[2] != l || t->ne[1] * t->ne[3] != heads ||
+        !ggml_are_same_shape(x[2], add) || memcmp(x[1]->op_params, split_axes, sizeof(split_axes)) != 0 ||
+        memcmp(x[4]->op_params, head_axes, sizeof(head_axes)) != 0) { return nullptr; }
+    if (coeffs->op != GGML_OP_CONT || coeffs->src[0]->op != GGML_OP_PERMUTE ||
+        memcmp(coeffs->src[0]->op_params, split_axes, sizeof(split_axes)) != 0) { return nullptr; }
+    const auto * p = coeffs->src[0]->src[0];
+    if (p->type != GGML_TYPE_F32 || !ggml_is_contiguous(p) || (pe && pe != p) ||
+        memcmp(p->ne, pe_shape, sizeof(pe_shape)) != 0) { return nullptr; }
+    pe = p;
+    nodes.push_back(coeffs);
+    return t;
+}
+
+static bool ggml_opencl_can_fuse_qkv(const ggml_backend_opencl_context * backend_ctx, const ggml_cgraph * graph, int first, ggml_opencl_qkv_preprocess & m) {
+    auto * begin = graph->nodes + first, * end = graph->nodes + graph->n_nodes;
+    auto * last = std::find_if(begin, end, [](const ggml_tensor * t) { return t->op == GGML_OP_FLASH_ATTN_EXT; });
+    if (last == end) { return false; }
+    const auto * attn = *last;
+    std::vector<const ggml_tensor *> nodes = {attn}, inputs;
+    const ggml_tensor * input[3];
+    const int32_t head_axes[] = {0, 2, 1, 3};
+    for (int j = 0; j < 3; ++j) {
+        const auto * t = attn->src[j];
+        if (t->type != (j == 0 ? GGML_TYPE_F32 : GGML_TYPE_F16) || !ggml_is_contiguous(t) ||
+            (j > 0 && !ggml_are_same_shape(t, attn->src[0]))) { return false; }
+        if (j > 0) {
+            if (t->op != GGML_OP_CPY || t->src[1] != t) { return false; }
+            nodes.push_back(t);
+            t = t->src[0];
+            if (t->op == GGML_OP_SCALE) {
+                if (ggml_get_op_params_f32(t, 1) != 0.0f) { return false; }
+                m.scale[j - 1] = ggml_get_op_params_f32(t, 0);
+                nodes.push_back(t);
+                t = t->src[0];
+            }
+        }
+        if (j < 2) {
+            input[j] = ggml_opencl_match_qkv_rope(t, m.pe, nodes);
+            if (!input[j]) { return false; }
+        } else {
+            for (ggml_op op : {GGML_OP_RESHAPE, GGML_OP_CONT, GGML_OP_PERMUTE}) {
+                if (t->op != op) { return false; }
+                if (op != GGML_OP_PERMUTE || t->src[0]->op == GGML_OP_CONCAT) { nodes.push_back(t); }
+                if (op == GGML_OP_PERMUTE && memcmp(t->op_params, head_axes, sizeof(head_axes)) != 0) { return false; }
+                t = t->src[0];
+            }
+            input[j] = t;
+        }
+    }
+    m.n_streams = input[0]->op == GGML_OP_CONCAT ? 2 : 1;
+    inputs.push_back(m.pe);
+    for (int j = 0; j < 3; ++j) {
+        if (!ggml_are_same_shape(input[0], input[j])) { return false; }
+        if (m.n_streams == 2) {
+            if (input[j]->op != GGML_OP_CONCAT || input[j]->op_params[0] != 2) { return false; }
+            nodes.push_back(input[j]);
+        }
+    }
+    for (int s = 0; s < m.n_streams; ++s) {
+        const auto * v = m.n_streams == 2 ? input[2]->src[s] : input[2];
+        if (v->type != GGML_TYPE_F32 || !v->view_src || !ggml_is_contiguous_rows(v)) { return false; }
+        m.src[s][2] = v;
+        inputs.push_back(v);
+        for (int j = 0; j < 2; ++j) {
+            const auto * mul = m.n_streams == 2 ? input[j]->src[s] : input[j];
+            const auto * norm = mul->src[0];
+            const auto * weight = mul->src[1];
+            auto * ni = std::find(begin, last + 1, norm);
+            if (ni >= last || ni[1] != mul || !ggml_opencl_can_fuse(backend_ctx, graph, ni - graph->nodes, {GGML_OP_RMS_NORM, GGML_OP_MUL}) ||
+                !weight || weight->type != GGML_TYPE_F32 || !ggml_is_contiguous(weight) ||
+                !ggml_is_vector(weight) || weight->ne[0] != norm->ne[0]) { return false; }
+            const auto * src = norm->src[0];
+            if (!ggml_are_same_layout(src, v) || src->view_src != v->view_src) { return false; }
+            m.src[s][j] = src;
+            m.weight[s][j] = weight;
+            m.eps[s][j] = ggml_get_op_params_f32(norm, 0);
+            nodes.insert(nodes.end(), {norm, mul});
+            inputs.insert(inputs.end(), {src, weight});
+        }
+    }
+    std::vector<ggml_op> ops;
+    for (auto * it = begin; it <= last; ++it) {
+        const auto * t = *it;
+        if (std::find(nodes.begin(), nodes.end(), t) != nodes.end()) {
+            m.nodes.push_back(it - graph->nodes);
+            ops.push_back(t->op);
+        } else if (!ggml_op_is_empty(t->op)) {
+            for (const auto * src : inputs) {
+                auto * producer = std::find(begin, last + 1, src);
+                if ((producer < it || producer == last + 1) && ggml_cl_tensors_overlap(t, src)) { return false; }
+            }
+        }
+    }
+    const int output = last - graph->nodes;
+    if (m.nodes.empty() || m.nodes.front() != first ||
+        !std::all_of(nodes.begin(), nodes.end(), [&](const ggml_tensor * t) { return std::find(begin, last + 1, t) != last + 1; }) ||
+        !ggml_can_fuse_subgraph_ext(graph, m.nodes.data(), m.nodes.size(), ops.data(), &output, 1)) { return false; }
+    m.attn = attn;
+    return true;
+}
+
 static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_opencl_context *backend_ctx = (ggml_backend_opencl_context *)backend->context;
+
+    // nightmare (dit/080): give the screen its turns on the GPU. A phone draws its UI on the same Adreno, and a DiT's
+    // graph was enqueued back to back: the S25 lagged severely at 512^2 with 2.2 GB of RAM still free (2026-10-31).
+    // GGML_OPENCL_YIELD_EVERY=N waits for the queue to drain after every N ops and sleeps GGML_OPENCL_YIELD_US (2000)
+    // so the compositor gets the GPU; GGML_OPENCL_YIELD_LOG=1 prints each graph's longest wait. With N = 1 that wait is
+    // one op's GPU time: an op longer than a frame cannot be helped by yielding between ops and must be split
+    // (GGML_OPENCL_MM_MAX_GFLOP, [ggml_cl_mul_mat]).
+    const int         yield_every = nm_yield_every();
+    static const bool yield_log   = getenv("GGML_OPENCL_YIELD_LOG") != nullptr;
+    int since_yield = 0, waits = 0;
+    double wait_ms = 0.0;
+    const ggml_tensor * last = nullptr;
+    // ⚠ nightmare (dit/081): the QKV fusion computes the nodes between its own through this function, so the longest
+    // wait is reset and logged only by the outermost call.
+    static thread_local int nm_depth = 0;
+    struct nm_depth_guard {
+        nm_depth_guard() { nm_depth++; }
+        ~nm_depth_guard() { nm_depth--; }
+    } nm_guard;
+    if (nm_depth == 1) {
+        nm_yield_max_ms   = 0.0;
+        nm_yield_max_name = nm_yield_max_op = "-";
+    }
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
@@ -9401,6 +9681,37 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
 
         if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
             continue;
+        }
+
+        if (yield_every > 0 && since_yield >= yield_every) {
+            wait_ms += nm_yield_now(backend_ctx, last);
+            waits++;
+            since_yield = 0;
+        }
+        since_yield++;
+        last = node;
+
+        if (!backend_ctx->disable_fusion && backend_ctx->kernel_fused_qknorm_rope_f32 &&
+            node->op == GGML_OP_RMS_NORM && node->src[0]->op == GGML_OP_VIEW) {
+            ggml_opencl_qkv_preprocess qkv;
+            if (ggml_opencl_can_fuse_qkv(backend_ctx, cgraph, i, qkv)) {
+                int first = i;
+                for (int idx : qkv.nodes) {
+                    if (first < idx) {
+                        auto inputs = ggml_graph_view(cgraph, first, idx);
+                        const auto status = ggml_backend_opencl_graph_compute(backend, &inputs);
+                        if (status != GGML_STATUS_SUCCESS) { return status; }
+                    }
+                    first = idx + 1;
+                }
+                ggml_opencl_op_qkv_preprocess(backend, qkv);
+                static std::once_flag qkv_logged;
+                std::call_once(qkv_logged, [] {
+                    GGML_LOG_INFO("ggml_opencl: QKV preprocess fused (PR #28446)\n");
+                });
+                i = qkv.nodes.back();
+                continue;
+            }
         }
 
         if (!backend_ctx->disable_fusion && ggml_opencl_can_fuse(backend_ctx, cgraph, i, { GGML_OP_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
@@ -9484,6 +9795,11 @@ static ggml_status ggml_backend_opencl_graph_compute(ggml_backend_t backend, ggm
             GGML_LOG_ERROR("%s: error: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
         }
         GGML_ASSERT(ok);
+    }
+
+    if (yield_every > 0 && yield_log && nm_depth == 1) {
+        GGML_LOG_INFO("ggml_opencl: yield every %d op(s): %d waits, %.1f ms waited, longest %.1f ms after %s (%s%s)\n",
+                      yield_every, waits, wait_ms, nm_yield_max_ms, nm_yield_max_name, nm_yield_max_op, nm_yield_max_shape);
     }
 
     return GGML_STATUS_SUCCESS;
@@ -10024,6 +10340,12 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             return op->ne[0] % 4 == 0 && ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_QKNORM_ROPE: {
 #ifdef GGML_OPENCL_USE_ADRENO_KERNELS
+            // nightmare (dit/081): GGML_OPENCL_NO_QKNORM_ROPE=1 declines our fused Q/K norm + RoPE, so sd.cpp builds
+            // RMS_NORM + MUL + ROPE and PR #28446's QKV preprocessing (which matches only that) can take them.
+            static const bool no_qknorm_rope = getenv("GGML_OPENCL_NO_QKNORM_ROPE") != nullptr;
+            if (no_qknorm_rope) {
+                return false;
+            }
             const ggml_tensor * src    = op->src[0];
             const ggml_tensor * weight = op->src[1];
             const ggml_tensor * theta  = op->src[2];
@@ -10346,7 +10668,7 @@ static bool ggml_opencl_supports_op(ggml_backend_dev_t dev, const struct ggml_te
             }
 
             if (dk == 512) {
-                if (backend_ctx->gpu_family == INTEL) {
+                if (backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI) {
                     return false;
                 }
                 if (!is_f32_f16) {
@@ -14232,9 +14554,16 @@ static ggml_backend_buffer_t ggml_backend_opencl_buffer_type_alloc_buffer(ggml_b
     // that do not export the symbol, so a build targeting them fails to link. The large
     // buffer extension is only ever enabled on drivers that are well past 3.0, so this path
     // is dead there anyway.
-    if (err != CL_SUCCESS && backend_ctx->adreno_use_large_buffer) {
+#ifdef _WIN32
+    const auto create_buffer_with_properties = &clCreateBufferWithProperties;
+#else
+    static const auto create_buffer_with_properties =
+        reinterpret_cast<decltype(&clCreateBufferWithProperties)>(
+            dlsym(RTLD_DEFAULT, "clCreateBufferWithProperties"));
+#endif
+    if (err != CL_SUCCESS && backend_ctx->adreno_use_large_buffer && create_buffer_with_properties) {
         cl_mem_properties props[] = { 0x41A6 /* CL_LARGE_BUFFER_QCOM */, 1, 0 };
-        mem = clCreateBufferWithProperties(backend_ctx->context, props, CL_MEM_READ_WRITE, size, NULL, &err);
+        mem = create_buffer_with_properties(backend_ctx->context, props, CL_MEM_READ_WRITE, size, NULL, &err);
     }
 #endif
     if (err != CL_SUCCESS) {
@@ -14987,8 +15316,8 @@ static void ggml_cl_set_rows(ggml_backend_t backend, const ggml_tensor * src0, c
     }
 
     int nth0 = 64;
-    if (backend_ctx->gpu_family == INTEL) {
-        nth0 = 32;
+    if (backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI) {
+        nth0 = (int) backend_ctx->subgroup_size;
     } else if (backend_ctx->gpu_family == ADRENO) {
         nth0 = 64;
     }
@@ -16487,18 +16816,7 @@ static void ggml_cl_rms_norm(ggml_backend_t backend, const ggml_tensor * src0, c
     // depends on subgroup size.
     // Note, this requires OpenCL 2.1 and above
     // For now we use fixed subgroup size to simplify support for OpenCL 2.0.
-    size_t sgs;
-    //CL_CHECK(clGetKernelSubGroupInfo(kernel, dev_ctx->device,
-    //    CL_KERNEL_MAX_SUB_GROUP_SIZE_FOR_NDRANGE,
-    //    sizeof(local_work_size), local_work_size,
-    //    sizeof(size_t), &sgs, NULL));
-    if (backend_ctx->gpu_family == ADRENO) {
-        sgs = 64;
-    } else if (backend_ctx->gpu_family == INTEL) {
-        sgs = 32;
-    } else {
-        GGML_ASSERT(false && "Unsupported GPU");
-    }
+    const size_t sgs = backend_ctx->subgroup_size;
 
     CL_CHECK(clSetKernelArg(kernel,  0, sizeof(cl_mem),    &extra0->data_device));
     CL_CHECK(clSetKernelArg(kernel,  1, sizeof(cl_ulong),  &offset0));
@@ -16570,6 +16888,75 @@ static void ggml_cl_qknorm_rope(ggml_backend_t backend, ggml_tensor * dst) {
 }
 #endif
 
+static void ggml_opencl_op_qkv_preprocess(ggml_backend_t backend, const ggml_opencl_qkv_preprocess & m) {
+    auto * ctx = (ggml_backend_opencl_context *) backend->context;
+    cl_kernel kernel = ctx->kernel_fused_qknorm_rope_f32;
+    size_t bytes = 0;
+    for (int j = 0; j < 3; ++j) { bytes += GGML_PAD(ggml_nbytes(m.attn->src[j]), 128); }
+    ctx->prealloc_fused_qkv.allocate(ctx->context, bytes);
+
+    ggml_tensor attn = *m.attn;
+    ggml_tensor qkv[3];
+    ggml_tensor_extra_cl extra[3] = {};
+    size_t offset = 0;
+    for (int j = 0; j < 3; ++j) {
+        qkv[j] = *m.attn->src[j];
+        extra[j].data_device = ctx->prealloc_fused_qkv.buffer;
+        extra[j].offset = offset;
+        extra[j].actual_size = ctx->prealloc_fused_qkv.size;
+        qkv[j].extra = &extra[j];
+        qkv[j].view_src = nullptr;
+        qkv[j].view_offs = 0;
+        attn.src[j] = &qkv[j];
+        offset += GGML_PAD(ggml_nbytes(&qkv[j]), 128);
+    }
+
+    int token_offset = 0;
+    for (int s = 0; s < m.n_streams; ++s) {
+        const auto & src = m.src[s];
+        int arg = 0;
+        auto tensor_arg = [&](const ggml_tensor * t) {
+            auto * extra = (ggml_tensor_extra_cl *) t->extra;
+            const cl_ulong offset = extra->offset + t->view_offs;
+            CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem), &extra->data_device));
+            CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_ulong), &offset));
+        };
+        auto * extra = (ggml_tensor_extra_cl *) src[0]->extra;
+        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(cl_mem), &extra->data_device));
+        cl_ulong4 offsets = {};
+        cl_ulong4 strides = {};
+        for (int j = 0; j < 3; ++j) {
+            auto * e = (ggml_tensor_extra_cl *) src[j]->extra;
+            GGML_ASSERT(e->data_device == extra->data_device);
+            offsets.s[j] = e->offset + src[j]->view_offs;
+        }
+        for (int j = 0; j < 4; ++j) { strides.s[j] = src[0]->nb[j]; }
+        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(offsets), &offsets));
+        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(strides), &strides));
+        tensor_arg(m.weight[s][0]);
+        tensor_arg(m.weight[s][1]);
+        tensor_arg(m.pe);
+        const cl_ulong pe_stride = m.pe->nb[3];
+        CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(pe_stride), &pe_stride));
+        for (const auto & dst : qkv) { tensor_arg(&dst); }
+        const int dims[] = {(int) src[0]->ne[0], (int) src[0]->ne[1],
+                            (int) src[0]->ne[2], (int) qkv[0].ne[1], token_offset};
+        for (const int & dim : dims) {
+            CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(dim), &dim));
+        }
+        const float params[] = {m.eps[s][0], m.eps[s][1], m.scale[0], m.scale[1]};
+        for (const float & value : params) {
+            CL_CHECK(clSetKernelArg(kernel, arg++, sizeof(value), &value));
+        }
+        size_t gws[] = {(size_t) dims[1] * 64, (size_t) dims[2] * (size_t) src[0]->ne[3]};
+        size_t lws[] = {64, 1};
+        ctx->enqueue_ndrange_kernel(kernel, 2, gws, lws, m.attn->src[0]);
+        token_offset += dims[2];
+    }
+    const bool ok = ggml_cl_compute_forward(backend, &attn);
+    GGML_ASSERT(ok);
+}
+
 static void ggml_opencl_op_rms_norm_fused(ggml_backend_t backend, ggml_tensor * rms_norm_tensor, ggml_tensor * mul_tensor) {
     GGML_ASSERT(mul_tensor);
     GGML_ASSERT(rms_norm_tensor);
@@ -16630,14 +17017,7 @@ static void ggml_opencl_op_rms_norm_fused(ggml_backend_t backend, ggml_tensor * 
 
     GGML_ASSERT(ne00 % 4 == 0);
 
-    size_t sgs;
-    if (backend_ctx->gpu_family == ADRENO) {
-        sgs = 64;
-    } else if (backend_ctx->gpu_family == INTEL) {
-        sgs = 32;
-    } else {
-        GGML_ASSERT(false && "Unsupported GPU");
-    }
+    const size_t sgs = backend_ctx->subgroup_size;
 
     cl_kernel kernel = backend_ctx->kernel_rms_norm_mul;
 
@@ -16712,10 +17092,7 @@ static void ggml_opencl_op_norm_fused(ggml_backend_t backend, ggml_tensor * norm
     const cl_ulong nb21 = src2->nb[1], nb22 = src2->nb[2], nb23 = src2->nb[3];
     const cl_ulong nbd1 = dst->nb[1], nbd2 = dst->nb[2], nbd3 = dst->nb[3];
 
-    size_t sgs;
-    if (backend_ctx->gpu_family == ADRENO) sgs = 64;
-    else if (backend_ctx->gpu_family == INTEL) sgs = 32;
-    else GGML_ASSERT(false && "Unsupported GPU");
+    const size_t sgs = backend_ctx->subgroup_size;
 
     cl_kernel kernel = backend_ctx->kernel_norm_mul_add;
 
@@ -16842,14 +17219,7 @@ static void ggml_cl_group_norm(ggml_backend_t backend, const ggml_tensor * src0,
 
     cl_kernel kernel = backend_ctx->kernel_group_norm;
 
-    size_t sgs = 64;
-    if (backend_ctx->gpu_family == ADRENO) {
-        sgs = 64;
-    } else if (backend_ctx->gpu_family == INTEL) {
-        sgs = 32;
-    } else {
-        GGML_ASSERT(false && "Unsupported GPU");
-    }
+    const size_t sgs = backend_ctx->subgroup_size;
 
     CL_CHECK(clSetKernelArg(kernel, 0, sizeof(cl_mem),   &extra0->data_device));
     CL_CHECK(clSetKernelArg(kernel, 1, sizeof(cl_ulong), &offset0));
@@ -16887,14 +17257,7 @@ static void ggml_cl_l2_norm(ggml_backend_t backend, const ggml_tensor * src0, co
     GGML_TENSOR_LOCALS(int,      ne0, src0, ne);
     GGML_TENSOR_LOCALS(cl_ulong, nb0, src0, nb);
 
-    size_t sgs;
-    if (backend_ctx->gpu_family == ADRENO) {
-        sgs = 64;
-    } else if (backend_ctx->gpu_family == INTEL) {
-        sgs = 32;
-    } else {
-        GGML_ASSERT(false && "Unsupported GPU");
-    }
+    const size_t sgs = backend_ctx->subgroup_size;
 
     cl_kernel kernel = backend_ctx->kernel_l2_norm_f32;
 
@@ -19346,6 +19709,70 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
     const ggml_tensor * mask = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
 
+    // nightmare (dit/080): attention GGML_OPENCL_FA_SPLIT_HEADS heads per dispatch, as views (q, k, v along ne[2], the
+    // output along its heads, ne[1]), with the screen's turn between, as the matmul split does. Z-Image's 30 heads at
+    // 512^2 were one 39 ms dispatch on the S25. Whole GQA groups only; not with a per-head mask or sinks.
+    // ⭐ …and GGML_OPENCL_FA_SPLIT_Q query rows at a time (q along ne[1], the output along ne[2], the mask's rows):
+    // every query row attends on its own, so this is exact too. Klein 4B at 1024^2 is 4,608 tokens, ~24 ms a head.
+    static const int fa_split_q = [] { const char * e = getenv("GGML_OPENCL_FA_SPLIT_Q"); int r = e ? atoi(e) : 0; return r > 0 && r < 64 ? 64 : r - r % 64; }();
+    if (fa_split_q > 0 && q->ne[1] > fa_split_q && sinks == nullptr && q->ne[3] == 1 && dst->ne[3] == 1 &&
+        dst->ne[2] == q->ne[1] && (mask == nullptr || (mask->ne[2] == 1 && mask->ne[3] == 1 && mask->ne[1] >= q->ne[1]))) {
+        ggml_backend_opencl_context * bctx = (ggml_backend_opencl_context *) backend->context;
+        for (int64_t r0 = 0; r0 < q->ne[1]; r0 += fa_split_q) {
+            const int64_t r  = q->ne[1] - r0 < fa_split_q ? q->ne[1] - r0 : fa_split_q;
+            ggml_tensor   qc = *q, dc = *dst, mc;
+            qc.ne[1]     = r;
+            qc.view_offs = q->view_offs + (size_t) r0 * q->nb[1];
+            dc.ne[2]     = r;
+            dc.view_offs = dst->view_offs + (size_t) r0 * dst->nb[2];
+            dc.src[0]    = &qc;
+            if (mask) {
+                mc           = *mask;
+                mc.ne[1]     = r;
+                mc.view_offs = mask->view_offs + (size_t) r0 * mask->nb[1];
+                dc.src[3]    = &mc;
+            }
+            if (r0 > 0 && nm_yield_every() > 0) {
+                nm_yield_now(bctx, dst, true);
+            }
+            ggml_cl_flash_attn(backend, &qc, k, &dc);
+        }
+        return;
+    }
+
+    static const int fa_split = [] { const char * e = getenv("GGML_OPENCL_FA_SPLIT_HEADS"); return e ? atoi(e) : 0; }();
+    if (fa_split > 0 && sinks == nullptr && (mask == nullptr || mask->ne[2] == 1) && q->ne[3] == 1 &&
+        k->ne[3] == 1 && v->ne[3] == 1 && dst->ne[3] == 1 && q->ne[2] % k->ne[2] == 0 && dst->ne[1] == q->ne[2]) {
+        const int64_t ratio   = q->ne[2] / k->ne[2];
+        int64_t       h_chunk = fa_split - fa_split % ratio;
+        if (h_chunk < ratio) {
+            h_chunk = ratio;
+        }
+        if (q->ne[2] > h_chunk) {
+            ggml_backend_opencl_context * bctx = (ggml_backend_opencl_context *) backend->context;
+            for (int64_t h0 = 0; h0 < q->ne[2]; h0 += h_chunk) {
+                const int64_t h  = q->ne[2] - h0 < h_chunk ? q->ne[2] - h0 : h_chunk;
+                ggml_tensor   qc = *q, kc = *k, vc = *v, dc = *dst;
+                qc.ne[2]     = h;
+                qc.view_offs = q->view_offs + (size_t) h0 * q->nb[2];
+                kc.ne[2]     = h / ratio;
+                kc.view_offs = k->view_offs + (size_t) (h0 / ratio) * k->nb[2];
+                vc.ne[2]     = h / ratio;
+                vc.view_offs = v->view_offs + (size_t) (h0 / ratio) * v->nb[2];
+                dc.ne[1]     = h;
+                dc.view_offs = dst->view_offs + (size_t) h0 * dst->nb[1];
+                dc.src[0]    = &qc;
+                dc.src[1]    = &kc;
+                dc.src[2]    = &vc;
+                if (h0 > 0 && nm_yield_every() > 0) {
+                    nm_yield_now(bctx, dst, true);
+                }
+                ggml_cl_flash_attn(backend, &qc, &kc, &dc);
+            }
+            return;
+        }
+    }
+
     GGML_ASSERT(q->extra);
     GGML_ASSERT(k->extra);
     GGML_ASSERT(v->extra);
@@ -20252,7 +20679,8 @@ static void ggml_cl_flash_attn(ggml_backend_t backend, const ggml_tensor * q, co
             backend_ctx->enqueue_ndrange_kernel(kernel, 3, global_work_size, local_work_size, dst);
         } else {
             // q1_vec dispatches with NSG subgroups
-            const size_t q1_wg = backend_ctx->gpu_family == INTEL ? 32 : 64;
+            const size_t q1_wg = backend_ctx->gpu_family == ADRENO
+                ? 64 : backend_ctx->subgroup_size;
             const size_t wg_size = use_q1_vec ? 256 : q1_wg;
             const size_t head_dim_global = use_q1_vec_mq
                 ? (size_t)(n_head_kv * n_batch)
@@ -21589,7 +22017,7 @@ static void ggml_cl_mul_mat_q4_0_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK((b_img_trans = clCreateImage(context, 0, &img_fmt, &img_desc, NULL, &err), err));
 
         // subbuffer for output
-        region.origin = extrad->offset; // Specify the starting offset (in bytes)
+        region.origin = extrad->offset + dst->view_offs; // nightmare (dit/085): a token chunk's view (dit/080) writes at ITS rows
         region.size = M * N * sizeof(float); // Specify the size of the sub-buffer
         CL_CHECK((d_sub_buf = clCreateSubBuffer(extrad->data_device, CL_MEM_WRITE_ONLY, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
 
@@ -22060,7 +22488,7 @@ static void ggml_cl_mul_mat_q5_0_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK((b_img_trans = clCreateImage(context, 0, &img_fmt, &img_desc, NULL, &err), err));
 
         // subbuffer for output
-        region.origin = extrad->offset;
+        region.origin = extrad->offset + dst->view_offs; // nightmare (dit/085)
         region.size = M * N * sizeof(float);
         CL_CHECK((d_sub_buf = clCreateSubBuffer(extrad->data_device, CL_MEM_WRITE_ONLY, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
 
@@ -22241,7 +22669,7 @@ static void ggml_cl_mul_mat_q5_1_f32_adreno(ggml_backend_t backend, const ggml_t
         CL_CHECK((b_img_trans = clCreateImage(context, 0, &img_fmt, &img_desc, NULL, &err), err));
 
         // subbuffer for output
-        region.origin = extrad->offset;
+        region.origin = extrad->offset + dst->view_offs; // nightmare (dit/085)
         region.size = M * N * sizeof(float);
         CL_CHECK((d_sub_buf = clCreateSubBuffer(extrad->data_device, CL_MEM_WRITE_ONLY, CL_BUFFER_CREATE_TYPE_REGION, &region, &err), err));
 
@@ -25664,6 +26092,43 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     GGML_ASSERT(dst);
     GGML_ASSERT(dst->extra);
 
+    // nightmare (dit/080): one matmul at most GGML_OPENCL_MM_MAX_GFLOP of work per dispatch, the rest in TOKEN chunks
+    // (rows of src1 and dst, as views: each output element's sum is unchanged), with the screen's turn between them
+    // when yielding is on. A DiT's FFN at 512^2 was one 80 ms dispatch on the S25, five frames the UI could not draw.
+    static const double mm_max_gflop = [] { const char * e = getenv("GGML_OPENCL_MM_MAX_GFLOP"); return e ? atof(e) : 0.0; }();
+    // ⚠ Unquantised weights take the generic kernels: ~0.3 TFLOPS on the S25 against ~1.6 for Q4_0 (Klein's f16 txt_in
+    // was a 35 ms chunk at the Q4_0 budget), so their GFLOP count x GGML_OPENCL_MM_F16_COST (4) against the cap.
+    static const double mm_f16_cost  = [] { const char * e = getenv("GGML_OPENCL_MM_F16_COST"); return e ? atof(e) : 4.0; }();
+    if (mm_max_gflop > 0.0 && src1->ne[2] == 1 && src1->ne[3] == 1 && dst->ne[2] == 1 && dst->ne[3] == 1 &&
+        ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
+        const bool   generic   = src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || src0->type == GGML_TYPE_F32;
+        const double per_token = 2.0 * (double) src0->ne[0] * (double) src0->ne[1] / 1e9 * (generic ? mm_f16_cost : 1.0);
+        const int64_t n_tok    = src1->ne[1];
+        int64_t chunk          = (int64_t) (mm_max_gflop / per_token);
+        chunk                  = chunk < 64 ? 64 : chunk - chunk % 64;
+        if (n_tok > chunk) {
+            ggml_backend_opencl_context * bctx = (ggml_backend_opencl_context *) backend->context;
+            for (int64_t t = 0; t < n_tok; t += chunk) {
+                const int64_t n = n_tok - t < chunk ? n_tok - t : chunk;
+                ggml_tensor   s1 = *src1;
+                ggml_tensor   d  = *dst;
+                s1.ne[1]     = n;
+                s1.nb[2]     = s1.nb[1] * n;
+                s1.nb[3]     = s1.nb[2];
+                s1.view_offs = src1->view_offs + (size_t) t * src1->nb[1];
+                d.ne[1]      = n;
+                d.nb[2]      = d.nb[1] * n;
+                d.nb[3]      = d.nb[2];
+                d.view_offs  = dst->view_offs + (size_t) t * dst->nb[1];
+                if (t > 0 && nm_yield_every() > 0) {
+                    nm_yield_now(bctx, dst, true);
+                }
+                ggml_cl_mul_mat(backend, src0, &s1, &d);
+            }
+            return;
+        }
+    }
+
     // bf16 is stored as f16 on device
     const enum ggml_type src0t = (src0->type == GGML_TYPE_BF16) ? GGML_TYPE_F16 : src0->type;
     const enum ggml_type src1t = src1->type;
@@ -25764,7 +26229,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
     }
 #endif
 
-    int nth0 = 32;
+    int nth0 = backend_ctx->gpu_family == MALI ? (int) backend_ctx->subgroup_size : 32;
     int nth1 = 1;
     int nrows = 1;
     // The number of values produced by each subgroup
@@ -26738,7 +27203,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 
                 kernel = backend_ctx->kernel_mul_mm_q4_k_f32_l4_lm;
                 // (BM*BN)/(TM*TN): Intel uses an 8x8 microtile (WG=64), others 4x8 (WG=128)
-                nth0 = (backend_ctx->gpu_family == INTEL) ? 64 : 128;
+                nth0 = (backend_ctx->gpu_family == ADRENO) ? 128 : 64;
 
                 int batch_stride_a = ne00*ne01;
                 int batch_stride_b = ne10*ne11;
@@ -26782,7 +27247,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 }
 
                 kernel = backend_ctx->kernel_mul_mm_q5_k_f32_l4_lm;
-                nth0 = (backend_ctx->gpu_family == INTEL) ? 64 : 128; // Intel 8x8 microtile
+                nth0 = (backend_ctx->gpu_family == ADRENO) ? 128 : 64; // Intel 8x8 microtile
 
                 int batch_stride_a = ne00*ne01;
                 int batch_stride_b = ne10*ne11;
@@ -26892,7 +27357,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
                 GGML_ASSERT(ne11 == ne1);
                 GGML_ASSERT(ne01 == ne0);
 
-                if (backend_ctx->gpu_family == INTEL) {
+                if (backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI) {
                     nth0 = 16;
                     nth1 = 1;
 
@@ -26931,7 +27396,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             size_t global_work_size[] = {(size_t)(ne01 + 7)/8*nth0, (size_t)ne11*nth1, (size_t)ne12*ne13};
             size_t local_work_size[] = {(size_t)nth0, (size_t)nth1, 1};
 
-            if (backend_ctx->gpu_family == INTEL) {
+            if (backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI) {
                 // Set global size for Intel. It uses 16x output values.
                 global_work_size[0] = (size_t)(ne01 + 15)/16*nth0;
                 global_work_size[1] = (size_t)ne11*nth1;
@@ -26955,8 +27420,8 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             kernel = backend_ctx->kernel_mul_mat_f32_f32;
             nrows = 4;
 
-            if (backend_ctx->gpu_family == INTEL) {
-                nth0 = 32;
+            if (backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI) {
+                nth0 = backend_ctx->gpu_family == MALI ? (int) backend_ctx->subgroup_size : 32;
                 nth1 = 1;
             } else if (backend_ctx->gpu_family == ADRENO) {
                 nth0 = 64;
@@ -26992,8 +27457,8 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             break;
         case GGML_TYPE_F16:
             //GGML_ASSERT(ne02 == ne12);
-            if (backend_ctx->gpu_family == INTEL) {
-                nth0 = 32;
+            if (backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI) {
+                nth0 = backend_ctx->gpu_family == MALI ? (int) backend_ctx->subgroup_size : 32;
                 nth1 = 1;
             } else if (backend_ctx->gpu_family == ADRENO) {
                 nth0 = 64;
@@ -27163,7 +27628,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             // nth0 - subgroup size
             // nth1 - number of subgroups per workgroup
             // ndst - number of output values per workgroup = output per subgroup * number of subgroups
-            if (backend_ctx->gpu_family == INTEL) {
+            if (backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI) {
                 nth0 = 16;
                 nth1 = 2;
                 ndst = nth1*4;
@@ -27197,7 +27662,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 #else
             kernel = backend_ctx->kernel_mul_mv_q1_0_f32;
 
-            if (backend_ctx->gpu_family == INTEL) {
+            if (backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI) {
                 nth0 = 16;
                 nth1 = 2;
                 ndst = nth1*4;
@@ -27237,7 +27702,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             GGML_ASSERT(ne01 == ne0);
 
 #ifdef GGML_OPENCL_SOA_Q
-            if (backend_ctx->gpu_family == INTEL) {
+            if (backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI) {
                 nth0 = 16;
                 nth1 = 1;
 
@@ -27269,7 +27734,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             CL_CHECK(clSetKernelArg(kernel, 13, sizeof(int),      &r2));
             CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &r3));
 #else // GGML_OPENCL_SOA_Q
-            if (backend_ctx->gpu_family == INTEL) {
+            if (backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI) {
                 // Use 1D local size. Each workgroup is a SIMD group. Each SIMD
                 // group produces N_DST (4 for Q4_0 kernel) values in the result.
                 // The number of workgroups on dim 0 (the leading dimension) is
@@ -27308,7 +27773,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             break;
         case GGML_TYPE_Q4_1: {
 #ifdef GGML_OPENCL_SOA_Q
-            if (backend_ctx->gpu_family == INTEL) {
+            if (backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI) {
                 nth0 = 16;
                 nth1 = 1;
                 ndst = 4;
@@ -27339,7 +27804,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &r2));
             CL_CHECK(clSetKernelArg(kernel, 15, sizeof(int),      &r3));
 #else
-            if (backend_ctx->gpu_family == INTEL) {
+            if (backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI) {
                 nth0 = 16;
                 nth1 = 1;
                 ndst = 4;
@@ -27373,7 +27838,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         }
         case GGML_TYPE_Q5_0: {
 #ifdef GGML_OPENCL_SOA_Q
-            if (backend_ctx->gpu_family == INTEL) {
+            if (backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI) {
                 nth0 = 16;
                 nth1 = 1;
                 ndst = 4;
@@ -27404,7 +27869,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             CL_CHECK(clSetKernelArg(kernel, 14, sizeof(int),      &r2));
             CL_CHECK(clSetKernelArg(kernel, 15, sizeof(int),      &r3));
 #else
-            if (backend_ctx->gpu_family == INTEL) {
+            if (backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI) {
                 nth0 = 16;
                 nth1 = 1;
                 ndst = 4;
@@ -27438,7 +27903,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
         }
         case GGML_TYPE_Q5_1: {
 #ifdef GGML_OPENCL_SOA_Q
-            if (backend_ctx->gpu_family == INTEL) {
+            if (backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI) {
                 nth0 = 16;
                 nth1 = 1;
                 ndst = 4;
@@ -27470,7 +27935,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             CL_CHECK(clSetKernelArg(kernel, 15, sizeof(int),      &r2));
             CL_CHECK(clSetKernelArg(kernel, 16, sizeof(int),      &r3));
 #else
-            if (backend_ctx->gpu_family == INTEL) {
+            if (backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI) {
                 nth0 = 16;
                 nth1 = 1;
                 ndst = 4;
@@ -27509,7 +27974,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             // nth0 - subgroup size
             // nth1 - number of subgroups per workgroup
             // ndst - number of output values per workgroup = output per subgroup * number of subgroups
-            if (backend_ctx->gpu_family == INTEL) {
+            if (backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI) {
                 nth0 = 16;
                 nth1 = 2;
                 ndst = nth1*4;
@@ -27546,7 +28011,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             // nth0 - subgroup size
             // nth1 - number of subgroups per workgroup
             // ndst - number of output values per workgroup = output per subgroup * number of subgroups
-            if (backend_ctx->gpu_family == INTEL) {
+            if (backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI) {
                 nth0 = 16;
                 nth1 = 2;
                 ndst = nth1*4;
@@ -27584,7 +28049,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 #ifdef GGML_OPENCL_SOA_Q
             kernel = backend_ctx->kernel_mul_mv_iq4_nl_f32_flat;
 
-            if (backend_ctx->gpu_family == INTEL) {
+            if (backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI) {
                 nth0 = 16;
                 nth1 = 1;
                 ndst = 8;
@@ -27614,7 +28079,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 #else
             kernel = backend_ctx->kernel_mul_mv_iq4_nl_f32;
 
-            if (backend_ctx->gpu_family == INTEL) {
+            if (backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI) {
                 nth0 = 16;
                 nth1 = 1;
                 ndst = 4;
@@ -27775,7 +28240,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 #ifdef GGML_OPENCL_SOA_Q
             kernel = backend_ctx->kernel_mul_mv_q4_K_f32_flat;
 
-            if (backend_ctx->gpu_family == INTEL) {
+            if (backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI) {
                 nth0 = 16;
                 nth1 = 1;
                 ndst = 16; // 8->16 rows per subgroup — matches N_DST in mul_mv_q4_k_f32_flat.cl (32 spills)
@@ -27811,7 +28276,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 #else
             kernel = backend_ctx->kernel_mul_mv_q4_K_f32;
 
-            if (backend_ctx->gpu_family == INTEL) {
+            if (backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI) {
                 nth0 = 16;
                 nth1 = 1;
                 ndst = 4;
@@ -27849,7 +28314,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 #ifdef GGML_OPENCL_SOA_Q
                 kernel = backend_ctx->kernel_mul_mv_q5_K_f32_flat;
 
-            if (backend_ctx->gpu_family == INTEL) {
+            if (backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI) {
                 nth0 = 16;
                 nth1 = 1;
                 ndst = 8; // 4->8 rows per subgroup (2x activation reuse)
@@ -27886,7 +28351,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 #else
             kernel = backend_ctx->kernel_mul_mv_q5_K_f32;
 
-            if (backend_ctx->gpu_family == INTEL) {
+            if (backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI) {
                 nth0 = 16;
                 nth1 = 1;
                 ndst = 4;
@@ -27924,7 +28389,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 #ifdef GGML_OPENCL_SOA_Q
             kernel = backend_ctx->kernel_mul_mv_q6_K_f32_flat;
 
-            if (backend_ctx->gpu_family == INTEL) {
+            if (backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI) {
                 nth0 = 16;
                 nth1 = 2;
                 ndst = 4;
@@ -27962,7 +28427,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 #else
             kernel = backend_ctx->kernel_mul_mv_q6_K_f32;
 
-            if (backend_ctx->gpu_family == INTEL) {
+            if (backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI) {
                 nth0 = 16;
                 nth1 = 2;
                 ndst = 1;
@@ -27996,7 +28461,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
             kernel = backend_ctx->kernel_mul_mv_mxfp4_f32_flat;
 
             cl_mem q;
-            if (backend_ctx->gpu_family == INTEL) {
+            if (backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI) {
                 nth0 = 16;
                 nth1 = 2;
                 ndst = nth1*2;
@@ -28033,7 +28498,7 @@ static void ggml_cl_mul_mat(ggml_backend_t backend, const ggml_tensor * src0, co
 #else
             kernel = backend_ctx->kernel_mul_mv_mxfp4_f32;
 
-            if (backend_ctx->gpu_family == INTEL) {
+            if (backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI) {
                 nth0 = 16;
                 nth1 = 2;
                 ndst = nth1*2;
@@ -28693,7 +29158,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 #endif // GGML_OPENCL_USE_ADRENO_KERNELS
             kernel = backend_ctx->kernel_mul_mv_id_q4_0_f32_8x_flat;
 
-            if (backend_ctx->gpu_family == INTEL) {
+            if (backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI) {
                 sgs  = 16;
                 nsg  = 1;
                 ndst = 8;
@@ -29532,7 +29997,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 #ifdef GGML_OPENCL_SOA_Q
             kernel = backend_ctx->kernel_mul_mv_id_q8_0_f32_flat;
 
-            if (backend_ctx->gpu_family == INTEL) {
+            if (backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI) {
                 sgs  = 16;
                 nsg  = 2;
                 ndst = 4;
@@ -29568,7 +30033,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 #else
             kernel = backend_ctx->kernel_mul_mv_id_q8_0_f32;
 
-            if (backend_ctx->gpu_family == INTEL) {
+            if (backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI) {
                 sgs  = 16;
                 nsg  = 2;
                 ndst = 4;
@@ -30694,7 +31159,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
             kernel = backend_ctx->kernel_mul_mv_id_mxfp4_f32_flat;
 
             cl_mem q;
-            if (backend_ctx->gpu_family == INTEL) {
+            if (backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI) {
                 sgs  = 16;
                 nsg  = 2;
                 ndst = 2;
@@ -30737,7 +31202,7 @@ static void ggml_cl_mul_mat_id(ggml_backend_t backend, const ggml_tensor * src0,
 #else // GGML_OPENCL_SOA_Q
             kernel = backend_ctx->kernel_mul_mv_id_mxfp4_f32;
 
-            if (backend_ctx->gpu_family == INTEL) {
+            if (backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI) {
                 sgs  = 16;
                 nsg  = 2;
                 ndst = 2;
@@ -31254,9 +31719,8 @@ static void ggml_cl_soft_max(ggml_backend_t backend, const ggml_tensor * src0, c
     // where a row corresponds to leading dimension.
     int nth = MIN(32, ne00);
 
-    if (backend_ctx->gpu_family == INTEL) {
-        // This is the same as the initial value.
-        nth = MIN(32, ne00);
+    if (backend_ctx->gpu_family == INTEL || backend_ctx->gpu_family == MALI) {
+        nth = MIN((int) backend_ctx->subgroup_size, ne00);
     }
     else if (backend_ctx->gpu_family == ADRENO) {
         nth = 64;
@@ -32405,11 +32869,7 @@ static void ggml_cl_gated_delta_net(ggml_backend_t backend, ggml_tensor * dst) {
     CL_CHECK(clSetKernelArg(kernel, idx++, sizeof(cl_uint),    &K));
 
     // Subgroup size is 64 for Adreno and 32 for Intel
-    const int sg_size = backend_ctx->gpu_family == GPU_FAMILY::ADRENO ? 64 : backend_ctx->gpu_family == GPU_FAMILY::INTEL ? 32 : -1;
-    if (sg_size < 0) {
-        GGML_LOG_ERROR("Unsupported GPU Family: only Adreno and Intel are supported.\n");
-        exit(1);
-    }
+    const int sg_size = (int) backend_ctx->subgroup_size;
 
     // For the subgroup-shuffle kernel, we can safely prefer 8 lanes/column for S_v>=128
     // For the subgroup-shuffle kernel:

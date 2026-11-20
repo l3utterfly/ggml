@@ -1485,6 +1485,14 @@ static inline void fa_softmax_impl(
             const HVX_Vector v_zero      = Q6_V_vzero();
             HVX_Vector       v_p_rowsum0 = v_zero;
             HVX_Vector       v_p_rowsum1 = v_zero;
+            // dit/040: the cubic exp2, and on v79+ the row sum as ONE widening multiply-accumulate per vector
+            // (P x 1.0 into an f32 pair) in place of convert + two adds.
+            const HVX_Vector v_c3q       = hvx_exp2_f16_c3_qf16();
+#if __HVX_ARCH__ >= 79
+            const HVX_Vector v_one_hf    = hvx_vec_splat_f16(1.0f);
+            HVX_VectorPair   w_p_rowsum0 = Q6_W_vcombine_VV(v_zero, v_zero);
+            HVX_VectorPair   w_p_rowsum1 = Q6_W_vcombine_VV(v_zero, v_zero);
+#endif
 
             size_t c = 0;
             for (; c + 128 <= kv_rows; c += 128) {
@@ -1496,10 +1504,10 @@ static inline void fa_softmax_impl(
                 HVX_Vector v_s_minus_m0_1 = Q6_Vqf16_vsub_VhfVhf(my_row_buf0[ci1], v_dup_m0);
                 HVX_Vector v_s_minus_m1_1 = Q6_Vqf16_vsub_VhfVhf(my_row_buf1[ci1], v_dup_m1);
 
-                HVX_Vector v_p_row0_hf_0  = hvx_vec_exp2_f16(Q6_Vhf_equals_Vqf16(v_s_minus_m0_0));
-                HVX_Vector v_p_row1_hf_0  = hvx_vec_exp2_f16(Q6_Vhf_equals_Vqf16(v_s_minus_m1_0));
-                HVX_Vector v_p_row0_hf_1  = hvx_vec_exp2_f16(Q6_Vhf_equals_Vqf16(v_s_minus_m0_1));
-                HVX_Vector v_p_row1_hf_1  = hvx_vec_exp2_f16(Q6_Vhf_equals_Vqf16(v_s_minus_m1_1));
+                HVX_Vector v_p_row0_hf_0  = hvx_vec_exp2_f16_c3(Q6_Vhf_equals_Vqf16(v_s_minus_m0_0), v_c3q);
+                HVX_Vector v_p_row1_hf_0  = hvx_vec_exp2_f16_c3(Q6_Vhf_equals_Vqf16(v_s_minus_m1_0), v_c3q);
+                HVX_Vector v_p_row0_hf_1  = hvx_vec_exp2_f16_c3(Q6_Vhf_equals_Vqf16(v_s_minus_m0_1), v_c3q);
+                HVX_Vector v_p_row1_hf_1  = hvx_vec_exp2_f16_c3(Q6_Vhf_equals_Vqf16(v_s_minus_m1_1), v_c3q);
 
                 __fp16 *     out_dtile0  = p_st_base + ci0 * HMX_FP16_TILE_N_ELMS * 2;
                 __fp16 *     out_dtile1  = p_st_base + ci1 * HMX_FP16_TILE_N_ELMS * 2;
@@ -1516,6 +1524,12 @@ static inline void fa_softmax_impl(
                 *pv_p_out0_1               = Q6_V_lo_W(vp_p_dual1);
                 *pv_p_out1_1               = Q6_V_hi_W(vp_p_dual1);
 
+#if __HVX_ARCH__ >= 79
+                w_p_rowsum0 = Q6_Wsf_vmpyacc_WsfVhfVhf(w_p_rowsum0, v_p_row0_hf_0, v_one_hf);
+                w_p_rowsum0 = Q6_Wsf_vmpyacc_WsfVhfVhf(w_p_rowsum0, v_p_row0_hf_1, v_one_hf);
+                w_p_rowsum1 = Q6_Wsf_vmpyacc_WsfVhfVhf(w_p_rowsum1, v_p_row1_hf_0, v_one_hf);
+                w_p_rowsum1 = Q6_Wsf_vmpyacc_WsfVhfVhf(w_p_rowsum1, v_p_row1_hf_1, v_one_hf);
+#else
                 HVX_VectorPair vp_p0_0 = hvx_vec_f16_to_f32_shuff(v_p_row0_hf_0);
                 HVX_VectorPair vp_p1_0 = hvx_vec_f16_to_f32_shuff(v_p_row1_hf_0);
                 HVX_VectorPair vp_p0_1 = hvx_vec_f16_to_f32_shuff(v_p_row0_hf_1);
@@ -1525,14 +1539,20 @@ static inline void fa_softmax_impl(
                 v_p_rowsum0 = Q6_Vqf32_vadd_Vqf32Vqf32(v_p_rowsum0, Q6_Vqf32_vadd_VsfVsf(Q6_V_lo_W(vp_p0_1), Q6_V_hi_W(vp_p0_1)));
                 v_p_rowsum1 = Q6_Vqf32_vadd_Vqf32Vqf32(v_p_rowsum1, Q6_Vqf32_vadd_VsfVsf(Q6_V_lo_W(vp_p1_0), Q6_V_hi_W(vp_p1_0)));
                 v_p_rowsum1 = Q6_Vqf32_vadd_Vqf32Vqf32(v_p_rowsum1, Q6_Vqf32_vadd_VsfVsf(Q6_V_lo_W(vp_p1_1), Q6_V_hi_W(vp_p1_1)));
+#endif
             }
             for (size_t c_rem = c; c_rem < kv_rows; c_rem += 64) {
                 size_t     ci           = c_rem / 64;
                 HVX_Vector v_s_minus_m0 = Q6_Vqf16_vsub_VhfVhf(my_row_buf0[ci], v_dup_m0);
                 HVX_Vector v_s_minus_m1 = Q6_Vqf16_vsub_VhfVhf(my_row_buf1[ci], v_dup_m1);
 
-                HVX_Vector v_p_row0_hf  = hvx_vec_exp2_f16(Q6_Vhf_equals_Vqf16(v_s_minus_m0));
-                HVX_Vector v_p_row1_hf  = hvx_vec_exp2_f16(Q6_Vhf_equals_Vqf16(v_s_minus_m1));
+                HVX_Vector v_p_row0_hf  = hvx_vec_exp2_f16_c3(Q6_Vhf_equals_Vqf16(v_s_minus_m0), v_c3q);
+                HVX_Vector v_p_row1_hf  = hvx_vec_exp2_f16_c3(Q6_Vhf_equals_Vqf16(v_s_minus_m1), v_c3q);
+                if (kv_rows - c_rem < 64) {
+                    HVX_VectorPred keep = Q6_Q_vsetq2_R((kv_rows - c_rem) * sizeof(__fp16));
+                    v_p_row0_hf = Q6_V_vmux_QVV(keep, v_p_row0_hf, v_zero);
+                    v_p_row1_hf = Q6_V_vmux_QVV(keep, v_p_row1_hf, v_zero);
+                }
                 __fp16 *     out_dtile  = p_st_base + ci * HMX_FP16_TILE_N_ELMS * 2;
                 HVX_Vector * pv_p_out0  = ((HVX_Vector *) out_dtile) + r1 / 2;
                 HVX_Vector * pv_p_out1  = pv_p_out0 + 16;
@@ -1541,12 +1561,21 @@ static inline void fa_softmax_impl(
                 *pv_p_out0               = Q6_V_lo_W(vp_p_dual);
                 *pv_p_out1               = Q6_V_hi_W(vp_p_dual);
 
+#if __HVX_ARCH__ >= 79
+                w_p_rowsum0 = Q6_Wsf_vmpyacc_WsfVhfVhf(w_p_rowsum0, v_p_row0_hf, v_one_hf);
+                w_p_rowsum1 = Q6_Wsf_vmpyacc_WsfVhfVhf(w_p_rowsum1, v_p_row1_hf, v_one_hf);
+#else
                 HVX_VectorPair vp_p0 = hvx_vec_f16_to_f32_shuff(v_p_row0_hf);
                 HVX_VectorPair vp_p1 = hvx_vec_f16_to_f32_shuff(v_p_row1_hf);
 
                 v_p_rowsum0 = Q6_Vqf32_vadd_Vqf32Vqf32(v_p_rowsum0, Q6_Vqf32_vadd_VsfVsf(Q6_V_lo_W(vp_p0), Q6_V_hi_W(vp_p0)));
                 v_p_rowsum1 = Q6_Vqf32_vadd_Vqf32Vqf32(v_p_rowsum1, Q6_Vqf32_vadd_VsfVsf(Q6_V_lo_W(vp_p1), Q6_V_hi_W(vp_p1)));
+#endif
             }
+#if __HVX_ARCH__ >= 79
+            v_p_rowsum0 = Q6_Vqf32_vadd_VsfVsf(Q6_V_lo_W(w_p_rowsum0), Q6_V_hi_W(w_p_rowsum0));
+            v_p_rowsum1 = Q6_Vqf32_vadd_VsfVsf(Q6_V_lo_W(w_p_rowsum1), Q6_V_hi_W(w_p_rowsum1));
+#endif
 
             HVX_Vector rowsum0_sf = hvx_vec_reduce_sum_f32(Q6_Vsf_equals_Vqf32(v_p_rowsum0));
             HVX_Vector rowsum1_sf = hvx_vec_reduce_sum_f32(Q6_Vsf_equals_Vqf32(v_p_rowsum1));
@@ -2369,6 +2398,12 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                         void * curr_v = (void *) dma_queue_pop(dma_q).dst;
                         fa_phase_v_interleave(&factx, kv_rows, v_src_stride, curr_v, factx.vtcm_v_tiles[buf_idx], n_tiles_per_bc, kv_start);
 
+                        // Prefetch block step + 2
+                        if (!mask && step + 2 < n_active_blocks) {
+                            fa_prefetch_block(dma_q, k, v, mask, active_blocks[step + 2], Bc, size_k_row_padded, size_k_row, size_v_row_padded, size_v_row,
+                                              ik2, ik3, iv2, iv3, q_start, im3, kv_head, G, m_line_bytes, n_rows_q, nek1, buf_idx, &factx);
+                        }
+
                         // ---- 2. Pop and run mask-prep for current block ----
                         __fp16 * current_mask_vtcm = NULL;
                         if (mask) {
@@ -2461,7 +2496,7 @@ int hmx_flash_attn_ext(struct htp_ops_context * octx) {
                         }
 
                         // Prefetch block step + 2
-                        if (step + 2 < n_active_blocks) {
+                        if (mask && step + 2 < n_active_blocks) {
                             fa_prefetch_block(dma_q, k, v, mask, active_blocks[step + 2], Bc, size_k_row_padded, size_k_row, size_v_row_padded, size_v_row,
                                               ik2, ik3, iv2, iv3, q_start, im3, kv_head, G, m_line_bytes, n_rows_q, nek1, buf_idx, &factx);
                         }

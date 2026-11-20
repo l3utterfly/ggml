@@ -63,35 +63,59 @@ static void qknorm_rope_worker(unsigned int n, unsigned int i, void * data) {
     struct htp_thread_trace * tr = &c->ctx->trace[i];
     const uint32_t token_first = (uint32_t) (((uint64_t) c->n_tokens * i) / n);
     const uint32_t token_last = (uint32_t) (((uint64_t) c->n_tokens * (i + 1)) / n);
-    float theta_packed[256] __attribute__((aligned(128)));
+    enum { block_size = 4 };
+    float theta_packed[block_size][256] __attribute__((aligned(128)));
     float normalized[256] __attribute__((aligned(128)));
 
     float * scratch = (float *) c->ctx->vtcm_base + c->head_dim + i * c->scratch_stride;
     htp_trace_event_start(tr, HTP_TRACE_EVT_HVX_COMP, token_first);
-    for (uint32_t token = token_first; token < token_last; ++token) {
-        const dma_addr_t theta = c->theta + (dma_addr_t) token * 2 * c->head_dim * sizeof(float);
-        const float * row_theta = (const float *) (uintptr_t) theta;
-        if (theta > UINT32_MAX) {
-            dma_sync_read(c->ctx->dma[i], scratch, theta, 2 * c->head_dim * sizeof(float));
-            row_theta = scratch;
-        }
-        qknorm_rope_pack_theta(theta_packed, row_theta, c->head_dim);
-        for (uint32_t batch = 0; batch < c->n_batches; ++batch) {
-            for (uint32_t head = 0; head < c->n_heads; ++head) {
-                const dma_addr_t addr = c->src + (dma_addr_t) batch * c->src_batch_stride +
-                                    (size_t) token * c->src_token_stride +
-                                    (size_t) head * c->src_head_stride;
-                const float * src = (const float *) (uintptr_t) addr;
-                if (addr > UINT32_MAX || (addr & 127)) {
-                    dma_sync_read(c->ctx->dma[i], scratch, addr, c->head_dim * sizeof(float));
-                    src = scratch;
+    for (uint32_t block = token_first; block < token_last;) {
+        const uint32_t end = block + MIN(block_size, token_last - block);
+        const uint32_t next = MIN(block_size, token_last - end);
+        if (next) {
+            const uint32_t theta_bytes = 2 * c->head_dim * sizeof(float);
+            const dma_addr_t theta = c->theta + (dma_addr_t) end * theta_bytes;
+            if (theta + next * theta_bytes - 1 <= UINT32_MAX) {
+                hex_l2fetch((const void *) (uintptr_t) theta, next * theta_bytes, next * theta_bytes, 1);
+            }
+            const uint64_t width = (uint64_t) (c->n_heads - 1) * c->src_head_stride + c->head_dim * sizeof(float);
+            if (width < 65536 && c->src_token_stride < 65536) {
+                for (uint32_t batch = 0; batch < c->n_batches; ++batch) {
+                    const dma_addr_t addr = c->src + (dma_addr_t) batch * c->src_batch_stride + (dma_addr_t) end * c->src_token_stride;
+                    if (addr + (uint64_t) (next - 1) * c->src_token_stride + width - 1 <= UINT32_MAX) {
+                        hex_l2fetch((const void *) (uintptr_t) addr, width, c->src_token_stride, next);
+                    }
                 }
-                float * dst = c->dst + (((size_t) batch * c->n_heads + head) * c->n_tokens + token) * c->head_dim;
-                hvx_fast_rms_norm_mul_f32((const uint8_t *) src, (const uint8_t *) c->weight,
-                                           (uint8_t *) normalized, c->head_dim, c->epsilon, 0.0f);
-                qknorm_rope_apply_interleaved(dst, normalized, theta_packed, c->head_dim);
             }
         }
+        for (uint32_t token = block; token < end; ++token) {
+            const dma_addr_t theta = c->theta + (dma_addr_t) token * 2 * c->head_dim * sizeof(float);
+            const float * row_theta = (const float *) (uintptr_t) theta;
+            if (theta > UINT32_MAX) {
+                dma_sync_read(c->ctx->dma[i], scratch, theta, 2 * c->head_dim * sizeof(float));
+                row_theta = scratch;
+            }
+            qknorm_rope_pack_theta(theta_packed[token - block], row_theta, c->head_dim);
+        }
+        for (uint32_t batch = 0; batch < c->n_batches; ++batch) {
+            for (uint32_t head = 0; head < c->n_heads; ++head) {
+                for (uint32_t token = block; token < end; ++token) {
+                    const dma_addr_t addr = c->src + (dma_addr_t) batch * c->src_batch_stride +
+                                        (size_t) token * c->src_token_stride +
+                                        (size_t) head * c->src_head_stride;
+                    const float * src = (const float *) (uintptr_t) addr;
+                    if (addr > UINT32_MAX || (addr & 127)) {
+                        dma_sync_read(c->ctx->dma[i], scratch, addr, c->head_dim * sizeof(float));
+                        src = scratch;
+                    }
+                    float * dst = c->dst + (((size_t) batch * c->n_heads + head) * c->n_tokens + token) * c->head_dim;
+                    hvx_fast_rms_norm_mul_f32((const uint8_t *) src, (const uint8_t *) c->weight,
+                                               (uint8_t *) normalized, c->head_dim, c->epsilon, 0.0f);
+                    qknorm_rope_apply_interleaved(dst, normalized, theta_packed[token - block], c->head_dim);
+                }
+            }
+        }
+        block = end;
     }
     htp_trace_event_stop(tr, HTP_TRACE_EVT_HVX_COMP, token_first);
 }
